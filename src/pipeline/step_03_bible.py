@@ -86,10 +86,10 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     bible_yaml = provider.generate(
         system=system, prompt=bible_prompt, meta={"cfg": cfg}
     )
-    out_path = store.save_text("03_bible/characters.yaml", bible_yaml)
+    out_path = store.save_text("03_bible/characters.yaml", bible_yaml.text)
 
     return {
         "bible_path": out_path,
         "bible_prompt": bible_prompt,
-        "bible_text": bible_yaml,
+        "bible_text": bible_yaml.text,
     }

@@ -153,7 +153,7 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         },
     )
 
-    plan_obj = _parse_scene_plan(plan_text)
+    plan_obj = _parse_scene_plan(plan_text.text)
 
     scenes: List[Dict[str, Any]] = plan_obj.get("scenes", [])
     if not isinstance(scenes, list) or len(scenes) == 0:
@@ -187,9 +187,9 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
         scene_ms = t_scene.ms()
 
-        path = store.save_text(filename, scene_text)
+        path = store.save_text(filename, scene_text.text)
         scene_paths.append(path)
-        md_chunks.append(scene_text.strip() + "\n")
+        md_chunks.append(scene_text.text.strip() + "\n")
 
         # 事件：MODEL_CALL（scene_draft）
         log_event(

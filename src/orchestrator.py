@@ -112,10 +112,10 @@ def run_once(config_path="config/config.yaml", prompts_path="config/prompts.yaml
         )
         call_ms = t_call.ms()
 
-        output_hash = sha256_text(ideas_text)
+        output_hash = sha256_text(ideas_text.text)
 
         # 落盘
-        path = store.save_text("01_ideation/ideas.txt", ideas_text)
+        path = store.save_text("01_ideation/ideas.txt", ideas_text.text)
         artifact_hash = sha256_file(path)
 
         log.info(

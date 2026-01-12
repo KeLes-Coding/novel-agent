@@ -40,6 +40,6 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         system=system, prompt=outline_prompt, meta={"cfg": cfg}
     )
 
-    out_path = store.save_text("02_outline/outline.md", outline_md)
+    out_path = store.save_text("02_outline/outline.md", outline_md.text)
 
     return {"outline_path": out_path}
