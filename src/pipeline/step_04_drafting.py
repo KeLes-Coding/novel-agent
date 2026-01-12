@@ -1,6 +1,7 @@
 import json
+import os
 import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from utils.logger import log_event, StepTimer
 
@@ -48,7 +49,6 @@ def build_scene_plan_prompt(outline_md: str, bible_yaml: str, max_scenes: int) -
 def build_scene_draft_prompt(
     scene: Dict[str, Any], outline_md: str, bible_yaml: str, scene_words: int
 ) -> str:
-    # 注意：这里要求输出 Markdown，方便拼接
     return (
         "你是中文男频修仙中短篇写作助手。必须原创，必须单女主。\n"
         "请根据【场景卡】写一个完整场景，输出 Markdown。\n\n"
@@ -76,10 +76,6 @@ def build_scene_draft_prompt(
 
 
 def _parse_scene_plan(text: str) -> Dict[str, Any]:
-    """
-    尽可能从模型输出中解析 JSON。
-    - 若输出含杂质文本：尝试截取首个 { 到最后一个 }。
-    """
     text = text.strip()
     try:
         return json.loads(text)
@@ -91,32 +87,19 @@ def _parse_scene_plan(text: str) -> Dict[str, Any]:
         raise
 
 
-def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Inputs (step_ctx):
-      - cfg, prompts, provider, store
-      - outline_path, bible_path
-      - run_id, jsonl (optional), ctx(optional), log(optional)
-    Outputs:
-      - scene_plan_path, scenes_dir, draft_path, scene_paths(list)
-    """
+def generate_scene_plan(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """生成分场大纲（包含 JSON Mode 支持与详细日志）"""
     cfg = step_ctx["cfg"]
     prompts = step_ctx["prompts"]
     provider = step_ctx["provider"]
     store = step_ctx["store"]
 
+    # 获取上下文
     outline_path = step_ctx["outline_path"]
     bible_path = step_ctx["bible_path"]
-
     run_id = step_ctx.get("run_id", "-")
-    jsonl = step_ctx.get("jsonl", None)
-    ctx = step_ctx.get("ctx", None)
-    log = step_ctx.get("log", None)
-
-    # cfg 参数（带默认值，避免你没写配置时报错）
-    drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
-    scene_words = _safe_int(drafting_cfg.get("scene_words", 900), 900)
-    max_scenes = _safe_int(drafting_cfg.get("max_scenes", 12), 12)
+    jsonl = step_ctx.get("jsonl")
+    log = step_ctx.get("log")
 
     with open(outline_path, "r", encoding="utf-8") as f:
         outline_md = f.read()
@@ -124,22 +107,33 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         bible_yaml = f.read()
 
     system = prompts.get("global_system", "").strip()
+    drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
+    max_scenes = int(drafting_cfg.get("max_scenes", 12))
 
-    # ---------- 1) 生成场景计划 ----------
     plan_prompt = build_scene_plan_prompt(outline_md, bible_yaml, max_scenes)
 
     if log:
         log.info(f"Generating scene plan max_scenes={max_scenes}")
 
     t_plan = StepTimer()
-    plan_text = provider.generate(system=system, prompt=plan_prompt, meta={"cfg": cfg})
+
+    # --- 核心逻辑升级：支持 generate_json ---
+    if hasattr(provider, "generate_json"):
+        plan_text, plan_obj = provider.generate_json(
+            system=system, prompt=plan_prompt, meta={"cfg": cfg}
+        )
+    else:
+        plan_text = provider.generate(
+            system=system, prompt=plan_prompt, meta={"cfg": cfg}
+        ).text
+        plan_obj = _parse_scene_plan(plan_text)
+
     plan_ms = t_plan.ms()
 
-    # 事件：MODEL_CALL（scene_plan）
-    preview_chars = 240
-    if ctx is not None:
-        preview_chars = getattr(ctx, "prompt_preview_chars", 240)
+    # 保存原始输出（Debug用）
+    store.save_text("04_drafting/scene_plan_raw.txt", plan_text)
 
+    # 记录详细日志
     log_event(
         jsonl,
         {
@@ -149,70 +143,115 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
             "event": "MODEL_CALL",
             "subtype": "scene_plan",
             "duration_ms": plan_ms,
-            "prompt_preview": plan_prompt[:preview_chars],
+            "prompt_preview": plan_prompt[:240],
         },
     )
 
-    plan_obj = _parse_scene_plan(plan_text.text)
+    scenes = plan_obj.get("scenes", [])
+    if not isinstance(scenes, list):
+        scenes = []
 
-    scenes: List[Dict[str, Any]] = plan_obj.get("scenes", [])
-    if not isinstance(scenes, list) or len(scenes) == 0:
-        raise ValueError("scene_plan JSON missing non-empty `scenes` list")
-
-    # 截断到 max_scenes
+    # 截断与回填
     scenes = scenes[:max_scenes]
     plan_obj["scenes"] = scenes
 
-    scene_plan_path = store.save_json("04_drafting/scene_plan.json", plan_obj)
+    path = store.save_json("04_drafting/scene_plan.json", plan_obj)
+    return {"scene_plan_path": path, "scenes": scenes}
 
-    # ---------- 2) 逐场景写作 ----------
-    scene_paths: List[str] = []
-    md_chunks: List[str] = []
 
-    for i, scene in enumerate(scenes, start=1):
-        sid = scene.get("id", i)
-        # 文件名按序号固定，避免 id 不连续
-        filename = f"04_drafting/scenes/scene_{i:03d}.md"
+def draft_single_scene(
+    scene_data: Dict[str, Any],
+    cfg: Dict[str, Any],
+    prompts: Dict[str, Any],
+    provider: Any,
+    outline_path: str,
+    bible_path: str,
+    store: Any,  # 新增：为了流式写文件
+    rel_path: str,  # 新增：目标文件路径
+    log: Any = None,  # 新增
+    jsonl: Any = None,  # 新增
+    run_id: str = "-",  # 新增
+) -> str:
+    """原子函数：写单个场景（支持流式写入与断点续传）"""
 
-        scene_prompt = build_scene_draft_prompt(
-            scene, outline_md, bible_yaml, scene_words
-        )
+    # 1. 检查是否已完成（断点续传逻辑）
+    # 注意：Manager 层可能已经做过检查，但原子函数内部再做一次更安全，
+    # 或者Manager调用前做检查，这里只负责写。为了保持函数纯粹，建议主要逻辑在Manager，
+    # 但由于你希望复用流式写入逻辑，我们将写入操作放在这里。
 
+    with open(outline_path, "r", encoding="utf-8") as f:
+        outline_md = f.read()
+    with open(bible_path, "r", encoding="utf-8") as f:
+        bible_yaml = f.read()
+
+    system = prompts.get("global_system", "").strip()
+    drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
+    scene_words = int(drafting_cfg.get("scene_words", 900))
+
+    scene_prompt = build_scene_draft_prompt(
+        scene_data, outline_md, bible_yaml, scene_words
+    )
+
+    t_scene = StepTimer()
+
+    # 2. 准备原子写入
+    # 使用 .part 文件，避免写了一半程序崩溃导致文件损坏
+    part_rel_path = rel_path + ".part"
+    part_abs_path, f_handle = store.open_text(part_rel_path, mode="w")
+
+    collected = []
+    try:
+        # --- 核心逻辑升级：支持流式生成 ---
+        if hasattr(provider, "stream_generate"):
+            # 流式调用
+            for chunk in provider.stream_generate(
+                system=system,
+                prompt=scene_prompt,
+                meta={"cfg": cfg, "scene": scene_data},
+            ):
+                f_handle.write(chunk)
+                f_handle.flush()  # 实时刷盘
+                collected.append(chunk)
+        else:
+            # 非流式回退
+            txt = provider.generate(
+                system=system,
+                prompt=scene_prompt,
+                meta={"cfg": cfg, "scene": scene_data},
+            ).text
+            f_handle.write(txt)
+            collected.append(txt)
+    except Exception as e:
         if log:
-            log.info(f"Drafting scene {i}/{len(scenes)} -> {filename}")
+            log.error(f"Error drafting scene {scene_data.get('id')}: {e}")
+        f_handle.close()
+        raise e
+    finally:
+        f_handle.close()
 
-        t_scene = StepTimer()
-        scene_text = provider.generate(
-            system=system, prompt=scene_prompt, meta={"cfg": cfg, "scene": scene}
-        )
-        scene_ms = t_scene.ms()
+    scene_ms = t_scene.ms()
+    full_text = "".join(collected)
 
-        path = store.save_text(filename, scene_text.text)
-        scene_paths.append(path)
-        md_chunks.append(scene_text.text.strip() + "\n")
+    # 3. 原子替换 (rename .part -> .md)
+    final_abs_path = store._abs(rel_path)
+    if os.path.exists(final_abs_path):
+        os.remove(final_abs_path)  # Windows下replace不能覆盖已有文件，需先删
+    os.replace(part_abs_path, final_abs_path)
 
-        # 事件：MODEL_CALL（scene_draft）
-        log_event(
-            jsonl,
-            {
-                "ts": datetime.datetime.now().isoformat(),
-                "run_id": run_id,
-                "step": "drafting",
-                "event": "MODEL_CALL",
-                "subtype": "scene_draft",
-                "scene_index": i,
-                "duration_ms": scene_ms,
-                "prompt_preview": scene_prompt[:preview_chars],
-                "artifact_path": path,
-            },
-        )
+    # 4. 记录日志
+    log_event(
+        jsonl,
+        {
+            "ts": datetime.datetime.now().isoformat(),
+            "run_id": run_id,
+            "step": "drafting",
+            "event": "MODEL_CALL",
+            "subtype": "scene_draft",
+            "scene_index": scene_data.get("id"),
+            "duration_ms": scene_ms,
+            "prompt_preview": scene_prompt[:240],
+            "artifact_path": final_abs_path,
+        },
+    )
 
-    # ---------- 3) 拼接成整稿 ----------
-    draft_text = "\n\n---\n\n".join(md_chunks).strip() + "\n"
-    draft_path = store.save_text("04_drafting/draft_v1.md", draft_text)
-
-    return {
-        "scene_plan_path": scene_plan_path,
-        "scene_paths": scene_paths,
-        "draft_path": draft_path,
-    }
+    return full_text

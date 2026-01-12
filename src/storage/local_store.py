@@ -1,7 +1,7 @@
 # src/storage/local_store.py
 import os
 import json
-from typing import Any, Dict
+from typing import Any, Dict, TextIO, Tuple
 
 
 class LocalStore:
@@ -28,3 +28,13 @@ class LocalStore:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
         return path
+
+    def open_text(self, rel_path: str, mode: str = "w") -> Tuple[str, TextIO]:
+        """
+        用于流式写文件：返回 (abs_path, file_handle)
+        mode 推荐用 "w" 或 "a"
+        """
+        path = self._abs(rel_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        f = open(path, mode, encoding="utf-8", newline="\n")
+        return path, f
