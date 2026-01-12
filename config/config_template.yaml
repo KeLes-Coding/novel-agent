@@ -1,0 +1,79 @@
+project:
+  name: "fanqie-male-xiuxian-singleFL"
+  language: "zh-CN"
+  timezone: "Asia/Shanghai"
+
+content:
+  genre: "男频"
+  tags:
+    - "修仙"
+    - "单女主"
+  # 你随时改这里的 tags，Agent 自动生效
+  length:
+    target_words: 12000
+    min_words: 6000
+    max_words: 20000
+
+story_constraints:
+  pov: "第三人称"
+  tone: ["热血", "节奏快", "克制中带爽点"]
+  romance_rule: "单女主，感情线清晰但不喧宾夺主"
+  forbidden:
+    - "现实知名人物直接影射"
+    - "照搬影视/小说桥段台词"
+    - "低俗擦边"
+  originality:
+    max_reuse_ratio: 0.08   # 内部“高重复表达”阈值（先做启发式）
+    banned_phrases_path: "config/banned_phrases.txt"
+
+pipeline:
+  enabled_steps:
+    - ideation
+    - outline
+    - bible
+    - drafting
+    - qc
+    - editing
+    - publish_pack
+  drafting:
+    scene_words: 900
+    max_scenes: 20
+    cliffhanger_every_n_scenes: 2
+
+provider:
+  type: openai   # openai | anthropic | gemini | mock
+  model: gpt-4.1-mini
+  timeout_s: 60
+  max_retries: 2
+
+# 可选：不同厂商专属参数
+openai:
+  # base_url: https://api.openai.com/v1  # 如需代理/中转再开
+  # organization: xxx
+  # project: xxx
+
+anthropic:
+  # base_url: https://api.anthropic.com  # 如需代理/中转再开
+  max_tokens: 2048
+
+gemini:
+  # 使用 Gemini Developer API 时：设置 GEMINI_API_KEY 或 GOOGLE_API_KEY 即可 :contentReference[oaicite:4]{index=4}
+  # 如果你走 Vertex AI，后面再加对应 env/config
+  generation:
+    temperature: 0.8
+    max_output_tokens: 2048
+
+
+output:
+  runs_dir: "runs"
+  save_prompts: true
+  save_intermediate: true
+
+logging:
+  level: "DEBUG"
+  jsonl_events: true
+  rotate_mb: 50
+  backup_count: 10
+  include_prompt_preview: true
+  prompt_preview_chars: 240
+  pii_scrub: true
