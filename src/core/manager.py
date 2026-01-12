@@ -6,6 +6,7 @@ import yaml
 from typing import Dict, Any, Optional
 
 from utils.logger import RunContext, setup_loggers, StepTimer, LogAdapter, log_event
+from utils.trace_logger import TraceLogger, TracingProvider
 from utils.hashing import sha256_text, sha256_file
 from providers.factory import build_provider
 from storage.local_store import LocalStore
@@ -22,34 +23,49 @@ class ProjectManager:
         self.config = self._load_yaml(config_path)
         self.prompts = self._load_yaml("config/prompts.yaml")
 
-        # 初始化目录和ID
         runs_dir = self.config["output"]["runs_dir"]
+
         if run_id:
-            # 加载已有项目
+            # === 加载逻辑优化 ===
+            # 搜索匹配的文件夹
             self.run_id = run_id
-            # 简单的目录搜索逻辑
             self.run_dir = None
+
+            # 支持 Phase 1.5 的新命名结构 (runs/YYYY-MM-DD_HH-MM-SS_{uuid})
+            # 也兼容旧结构
             if os.path.exists(os.path.join(runs_dir, run_id)):
                 self.run_dir = os.path.join(runs_dir, run_id)
             else:
-                for date_dir in os.listdir(runs_dir):
-                    candidate = os.path.join(runs_dir, date_dir, run_id)
-                    if os.path.exists(candidate):
-                        self.run_dir = candidate
+                # 遍历寻找
+                for entry in os.listdir(runs_dir):
+                    # 检查是否包含该 run_id (新命名规则后缀包含 uuid)
+                    if run_id in entry:
+                        full_path = os.path.join(runs_dir, entry)
+                        if os.path.isdir(full_path):
+                            self.run_dir = full_path
+                            break
+                    # 兼容旧的 date/run_id 结构
+                    candidate_sub = os.path.join(runs_dir, entry, run_id)
+                    if os.path.exists(candidate_sub):
+                        self.run_dir = candidate_sub
                         break
 
             if not self.run_dir:
-                # Fallback: create if not found (or raise error)
                 raise ValueError(f"Run ID {run_id} not found in {runs_dir}")
 
             self.state = ProjectState.load(self.run_dir)
             self.logger_env = self._setup_logging(resume=True)
-            self.log.info(f"Loaded project: {run_id}, Current Step: {self.state.step}")
+            self.log.info(f"Loaded project: {run_id} from {self.run_dir}")
+
         else:
-            # 新建项目
-            today = datetime.date.today().isoformat()
-            self.run_id = f"run_{uuid.uuid4().hex[:8]}"
-            self.run_dir = os.path.join(runs_dir, today, self.run_id)
+            # === Phase 1.5: 目录结构规范化 ===
+            # 格式: runs/YYYY-MM-DD_HH-MM-SS_{short_uuid}
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
+            short_uid = uuid.uuid4().hex[:8]
+            self.run_id = f"{now_str}_{short_uid}"
+
+            # 直接放在 runs 目录下，不再按日期分层，方便排序
+            self.run_dir = os.path.join(runs_dir, self.run_id)
             os.makedirs(self.run_dir, exist_ok=True)
 
             self.state = ProjectState(run_id=self.run_id, run_dir=self.run_dir)
@@ -59,13 +75,25 @@ class ProjectManager:
             self.log.info(f"Initialized new project: {self.run_id}")
 
         self.store = LocalStore(self.run_dir)
-        self.provider = build_provider(self.config)
+
+        # === Phase 1.4: 全链路追踪集成 ===
+        # 1. 初始化 TraceLogger
+        trace_path = os.path.join(self.run_dir, "logs", "llm_trace.jsonl")
+        self.tracer = TraceLogger(trace_path)
+
+        # 2. 构建原始 Provider
+        raw_provider = build_provider(self.config)
+
+        # 3. 包装 Provider
+        # 动态获取当前 step 的 lambda
+        get_step = lambda: self.state.step
+        self.provider = TracingProvider(
+            raw_provider, self.tracer, self.run_id, get_step
+        )
 
     @property
     def log(self):
-        # --- 修复点 1: 使用 LogAdapter 注入 run_id 和 step ---
         base_logger = self.logger_env["logger"]
-        # 默认 step 为 manager，具体方法里可以覆盖
         return LogAdapter(base_logger, {"run_id": self.run_id, "step": "manager"})
 
     def _load_yaml(self, path: str) -> Dict[str, Any]:
@@ -73,6 +101,7 @@ class ProjectManager:
             return yaml.safe_load(f)
 
     def _setup_logging(self, resume: bool):
+        # 保持原有应用日志配置
         ctx = RunContext(
             run_id=self.run_id,
             run_dir=self.run_dir,

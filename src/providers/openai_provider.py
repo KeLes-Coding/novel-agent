@@ -81,7 +81,19 @@ class OpenAIProvider(LLMProvider):
             retryable_exceptions=RETRYABLE,
         )
         text = (resp.choices[0].message.content or "").strip()
-        return LLMResult(text=text, raw={"id": getattr(resp, "id", None)})
+
+        # --- 新增 usage 解析 ---
+        usage_dict = {}
+        if resp.usage:
+            usage_dict = {
+                "prompt_tokens": resp.usage.prompt_tokens,
+                "completion_tokens": resp.usage.completion_tokens,
+                "total_tokens": resp.usage.total_tokens,
+            }
+
+        return LLMResult(
+            text=text, raw={"id": getattr(resp, "id", None)}, usage=usage_dict
+        )
 
     def stream_generate(
         self, system: str, prompt: str, meta: Optional[Dict[str, Any]] = None

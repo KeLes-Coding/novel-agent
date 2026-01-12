@@ -21,14 +21,18 @@ class GeminiProvider(LLMProvider):
         # 会自动读取 GEMINI_API_KEY 或 GOOGLE_API_KEY
         # 优先级：显式传入 > 环境变量
         if api_key is None:
-            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+                "GOOGLE_API_KEY"
+            )
 
         client_kwargs = {}
         if api_key:
             client_kwargs["api_key"] = api_key
         if proxy_url:
             # Gemini 使用 HTTPX 代理
-            client_kwargs["http_options"] = {"proxies": {"https": proxy_url, "http": proxy_url}}
+            client_kwargs["http_options"] = {
+                "proxies": {"https": proxy_url, "http": proxy_url}
+            }
 
         self.client = genai.Client(**client_kwargs)
         self.model = model
@@ -38,7 +42,6 @@ class GeminiProvider(LLMProvider):
     def generate(
         self, system: str, prompt: str, meta: Optional[Dict[str, Any]] = None
     ) -> LLMResult:
-        # Gemini 的 system_instruction 放在 config 里 :contentReference[oaicite:9]{index=9}
         cfg = types.GenerateContentConfig(
             system_instruction=system,
             temperature=self.temperature,
@@ -50,4 +53,16 @@ class GeminiProvider(LLMProvider):
             config=cfg,
         )
         text = getattr(resp, "text", "") or ""
-        return LLMResult(text=text.strip(), raw={})
+
+        # --- 新增 usage 解析 ---
+        usage_dict = {}
+        # Gemini usage_metadata: prompt_token_count, candidates_token_count, total_token_count
+        um = getattr(resp, "usage_metadata", None)
+        if um:
+            usage_dict = {
+                "prompt_tokens": um.prompt_token_count,
+                "completion_tokens": um.candidates_token_count,
+                "total_tokens": um.total_token_count,
+            }
+
+        return LLMResult(text=text.strip(), raw={}, usage=usage_dict)

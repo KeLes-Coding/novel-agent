@@ -37,11 +37,11 @@
 * [x] **原子化**：实现 `generate_scene(scene_id)`，支持外部调度。
 
 #### 1.4 高级日志系统 (`src/utils/trace_logger.py`) **(New)**
-* [ ] **全链路追踪**：记录完整的 `Prompt (Input)`、`Completion (Output)`、`Token Usage`、`Latency`、`Model Config`。
-* [ ] **结构化存储**：每条日志应包含 `agent_id`（身份信息）、`step_name`、`timestamp`。
-* [ ] **兼容性**：提供 `migrate_logs.py` 脚本，将旧版纯文本日志转换为新的 JSONL 结构。
-* [ ] **本地落盘**：确保所有 API 交互都有本地副本（`.trace` 文件），用于微调数据积累。
-* [ ] **版本管理**: 保存修改记录，方便后续回滚。
+* [x] **全链路追踪**：记录完整的 `Prompt (Input)`、`Completion (Output)`、`Token Usage`、`Latency`、`Model Config`。
+* [x] **结构化存储**：每条日志应包含 `agent_id`（身份信息）、`step_name`、`timestamp`。
+* [x] **兼容性**：提供 `migrate_logs.py` 脚本，将旧版纯文本日志转换为新的 JSONL 结构。
+* [x] **本地落盘**：确保所有 API 交互都有本地副本（`.trace` 文件），用于微调数据积累。
+* [x] **版本管理**: 保存修改记录，方便后续回滚。
 
 #### 1.5 目录结构规范化 **(New)**
 * [ ] **时间序命名**：Runs 目录修改为 `runs/YYYY-MM-DD_HH-MM-SS_{uuid}/`，便于排序和检索。

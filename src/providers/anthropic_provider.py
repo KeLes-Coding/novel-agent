@@ -42,10 +42,24 @@ class AnthropicProvider(LLMProvider):
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
-        # content 是一个 list，常见是第一段 text
         text = ""
         for block in getattr(msg, "content", []) or []:
             t = getattr(block, "text", None)
             if t:
                 text += t
-        return LLMResult(text=text.strip(), raw={"id": getattr(msg, "id", None)})
+
+        # --- 新增 usage 解析 ---
+        usage_dict = {}
+        if hasattr(msg, "usage"):
+            # Anthropic usage structure: input_tokens, output_tokens
+            usage_dict = {
+                "prompt_tokens": getattr(msg.usage, "input_tokens", 0),
+                "completion_tokens": getattr(msg.usage, "output_tokens", 0),
+            }
+            usage_dict["total_tokens"] = (
+                usage_dict["prompt_tokens"] + usage_dict["completion_tokens"]
+            )
+
+        return LLMResult(
+            text=text.strip(), raw={"id": getattr(msg, "id", None)}, usage=usage_dict
+        )
