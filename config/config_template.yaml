@@ -10,9 +10,13 @@ content:
     - "单女主"
   # 你随时改这里的 tags，Agent 自动生效
   length:
-    target_words: 12000
-    min_words: 6000
-    max_words: 20000
+    # 核心控制参数
+    target_total_words: 30000   # 目标总字数 (例如 20万字)
+    avg_chapter_words: 1500      # 平均每章字数
+    
+    # 允许的浮动范围 (用于 QC 检查)
+    min_chapter_words: 2500
+    max_chapter_words: 3500
 
 story_constraints:
   pov: "第三人称"
@@ -37,7 +41,6 @@ pipeline:
     - publish_pack
   drafting:
     scene_words: 900
-    max_scenes: 20
     cliffhanger_every_n_scenes: 2
 
 provider:
