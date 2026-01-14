@@ -7,12 +7,16 @@ from typing import List, Dict, Optional, Any
 
 @dataclass
 class SceneNode:
-    """单个场景的状态节点"""
-
-    id: int  # 或 str
+    id: int
     title: str
-    status: str = "pending"  # pending, drafting, review, done
-    content_path: str = ""  # 正文存储路径
+    status: str = "pending"
+    content_path: str = ""
+    # === 新增 ===
+    summary: str = ""  # 本章剧情摘要 (Episodic Memory)
+    characters_involved: List[str] = field(
+        default_factory=list
+    )  # 本章出场人物 (用于索引)
+    # ============
     version: int = 1
     meta: Dict[str, Any] = field(default_factory=dict)
 

@@ -1,3 +1,4 @@
+# src/pipeline/step_02_outline.py
 from typing import Dict, Any
 
 
@@ -32,7 +33,13 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     with open(idea_path, "r", encoding="utf-8") as f:
         idea_text = f.read()
 
-    target_words = cfg["content"]["length"]["target_words"]
+    # === 修改处：兼容新旧配置键名 ===
+    len_cfg = cfg["content"]["length"]
+    # 优先取 target_total_words (新)，没有则取 target_words (旧)，最后默认 50000
+    target_words = len_cfg.get("target_total_words") or len_cfg.get(
+        "target_words", 50000
+    )
+
     system = prompts.get("global_system", "").strip()
 
     outline_prompt = build_outline_prompt(idea_text, target_words)

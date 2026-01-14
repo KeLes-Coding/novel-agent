@@ -1,3 +1,4 @@
+# src/pipeline/step_04_drafting.py
 import json
 import os
 import datetime
@@ -49,6 +50,11 @@ def build_scene_plan_prompt(outline_md: str, bible_yaml: str, max_scenes: int) -
 def build_scene_draft_prompt(
     scene: Dict[str, Any], outline_md: str, bible_yaml: str, scene_words: int
 ) -> str:
+    # 提取动态上下文（Phase 2 新增）
+    dynamic_ctx = scene.get("dynamic_context", {})
+    story_so_far = dynamic_ctx.get("story_so_far", "")
+    prev_text = dynamic_ctx.get("previous_text_tail", "")
+
     return (
         "你是中文男频修仙中短篇写作助手。必须原创，必须单女主。\n"
         "请根据【场景卡】写一个完整场景，输出 Markdown。\n\n"
@@ -68,6 +74,12 @@ def build_scene_draft_prompt(
         "正文正文正文...\n\n"
         "【场景卡】\n"
         f"{json.dumps(scene, ensure_ascii=False)}\n\n"
+        "【前情提要 (Story So Far)】\n"
+        "这里是之前章节发生的故事摘要，请确保剧情连贯：\n"
+        f"{story_so_far}\n\n"
+        "【上文衔接 (Immediate Context)】\n"
+        "这是上一章的结尾，请在文风和动作上无缝衔接（不要重复这段文字）：\n"
+        f"{prev_text}\n\n"
         "【大纲】\n"
         f"{outline_md}\n\n"
         "【角色圣经】\n"
@@ -107,13 +119,36 @@ def generate_scene_plan(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         bible_yaml = f.read()
 
     system = prompts.get("global_system", "").strip()
-    drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
-    max_scenes = int(drafting_cfg.get("max_scenes", 12))
 
-    plan_prompt = build_scene_plan_prompt(outline_md, bible_yaml, max_scenes)
+    # === 核心修改：动态计算章节数 (Phase 2) ===
+    # 废弃旧的 max_scenes 读取逻辑
+    # drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
+    # max_scenes = int(drafting_cfg.get("max_scenes", 12))
+
+    len_cfg = cfg.get("content", {}).get("length", {})
+    # 兼容新旧配置键名
+    total_words = int(
+        len_cfg.get("target_total_words") or len_cfg.get("target_words", 50000)
+    )
+    avg_words = int(len_cfg.get("avg_chapter_words", 3000))
+
+    # 向上取整计算目标章节数
+    target_scenes = (total_words + avg_words - 1) // avg_words
+
+    # 限制 LLM 一次生成的上限
+    max_scenes_limit = 60
+
+    # === 关键：这里必须使用计算出的 effective_scenes ===
+    effective_scenes = min(target_scenes, max_scenes_limit)
 
     if log:
-        log.info(f"Generating scene plan max_scenes={max_scenes}")
+        log.info(
+            f"Length Control: Target {total_words} words / {avg_words} per chapter = {target_scenes} scenes."
+        )
+        log.info(f"Generating scene plan for {effective_scenes} scenes.")
+
+    # 使用 effective_scenes 构建 Prompt
+    plan_prompt = build_scene_plan_prompt(outline_md, bible_yaml, effective_scenes)
 
     t_plan = StepTimer()
 
@@ -151,8 +186,8 @@ def generate_scene_plan(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(scenes, list):
         scenes = []
 
-    # 截断与回填
-    scenes = scenes[:max_scenes]
+    # 截断与回填 (以 effective_scenes 为准)
+    scenes = scenes[:effective_scenes]
     plan_obj["scenes"] = scenes
 
     path = store.save_json("04_drafting/scene_plan.json", plan_obj)
@@ -174,20 +209,22 @@ def draft_single_scene(
 ) -> str:
     """原子函数：写单个场景（支持流式写入与断点续传）"""
 
-    # 1. 检查是否已完成（断点续传逻辑）
-    # 注意：Manager 层可能已经做过检查，但原子函数内部再做一次更安全，
-    # 或者Manager调用前做检查，这里只负责写。为了保持函数纯粹，建议主要逻辑在Manager，
-    # 但由于你希望复用流式写入逻辑，我们将写入操作放在这里。
-
     with open(outline_path, "r", encoding="utf-8") as f:
         outline_md = f.read()
     with open(bible_path, "r", encoding="utf-8") as f:
         bible_yaml = f.read()
 
     system = prompts.get("global_system", "").strip()
-    drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
-    scene_words = int(drafting_cfg.get("scene_words", 900))
 
+    # 计算单章字数目标
+    len_cfg = cfg.get("content", {}).get("length", {})
+    # 优先使用 avg_chapter_words，回退使用旧的 drafting.scene_words
+    drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
+    scene_words = int(
+        len_cfg.get("avg_chapter_words") or drafting_cfg.get("scene_words", 3000)
+    )
+
+    # 构建包含动态上下文的 Prompt
     scene_prompt = build_scene_draft_prompt(
         scene_data, outline_md, bible_yaml, scene_words
     )

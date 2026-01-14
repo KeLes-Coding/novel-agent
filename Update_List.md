@@ -44,7 +44,7 @@
 * [x] **版本管理**: 保存修改记录，方便后续回滚。
 
 #### 1.5 目录结构规范化 **(New)**
-* [ ] **时间序命名**：Runs 目录修改为 `runs/YYYY-MM-DD_HH-MM-SS_{uuid}/`，便于排序和检索。
+* [x] **时间序命名**：Runs 目录修改为 `runs/YYYY-MM-DD/HH-MM-SS_{uuid}/`，便于排序和检索。
 
 ---
 
@@ -53,10 +53,10 @@
 **目标**：解决“上下文失忆”，实现 Bible 动态更新。
 
 #### 2.1 上下文构造器 (`src/core/context.py`)
-* [ ] **滑动窗口**：组装 Bible + Summary + 上文原文。
+* [x] **滑动窗口**：组装 Bible + Summary + 上文原文。
 
 #### 2.2 动态 Bible 更新器 (`src/agents/wiki_updater.py`)
-* [ ] **Wiki Agent**：每章结束后提取新设定，更新 `characters.yaml`。
+* [x] **Wiki Agent**：每章结束后提取新设定，更新 `characters.yaml`。
 
 ---
 
@@ -135,3 +135,4 @@ novel-agent/
 │   └── utils/           # 工具类 (Logger, Hasher)
 ├── main.py              # CLI 入口
 └── server.py            # (New) Web Server 入口
+```

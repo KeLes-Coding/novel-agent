@@ -59,7 +59,7 @@ class ProjectManager:
 
         else:
             # === Phase 1.5: 目录结构规范化 ===
-            # 格式: runs/YYYY-MM-DD_HH-MM-SS_{short_uuid}
+            # 格式: runs/YYYY-MM-DD/HH-MM-SS_{short_uuid}
             now_str = datetime.datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
             short_uid = uuid.uuid4().hex[:8]
             self.run_id = f"{now_str}_{short_uid}"
@@ -121,7 +121,9 @@ class ProjectManager:
 
         tags = self.config["content"]["tags"]
         genre = self.config["content"]["genre"]
-        target_words = self.config["content"]["length"]["target_words"]
+        target_words = self.config["content"]["length"].get(
+            "target_words", 200000
+        )  # 兼容新配置
 
         ideation_prompt = (
             self.prompts["ideation"].strip()
@@ -215,6 +217,7 @@ class ProjectManager:
                 "store": self.store,
                 "outline_path": self.state.outline_path,
                 "bible_path": self.state.bible_path,
+                "log": log,  # 传入 log 以便打印 length control 信息
             }
         )
 
@@ -233,7 +236,7 @@ class ProjectManager:
         log.info(f"Initialized {len(self.state.scenes)} scenes.")
 
     def run_drafting_loop(self):
-        """Step 04b: 循环生成正文（带自动重试机制）"""
+        """Step 04b: 循环生成正文（带自动重试机制 + 动态上下文）"""
         step_name = "drafting"
         log = LogAdapter(
             self.logger_env["logger"], {"run_id": self.run_id, "step": step_name}
@@ -244,6 +247,15 @@ class ProjectManager:
             log.warning("No scenes found. Run init_scenes() first.")
             return
 
+        # === Phase 2: 初始化动态记忆组件 ===
+        # 确保 core.context 和 agents.wiki_updater 已按计划实现
+        from core.context import ContextBuilder
+        from agents.wiki_updater import WikiUpdater
+
+        ctx_builder = ContextBuilder(self.state, self.store)
+        # WikiUpdater 需要 provider 来进行摘要生成
+        wiki_updater = WikiUpdater(self.provider, self.prompts.get("global_system", ""))
+
         import time  # 引入时间模块用于冷却
 
         for i, scene_node in enumerate(self.state.scenes):
@@ -251,6 +263,30 @@ class ProjectManager:
             if scene_node.status == "done":
                 log.info(f"Skipping Scene {scene_node.id} (Done)")
                 continue
+
+            # === Phase 2.1: 动态构建上下文 ===
+            log.info(f"Building context for Scene {scene_node.id}...")
+
+            # 使用 ContextBuilder 组装上下文
+            build_result = ctx_builder.build(scene_node.id)
+            context_payload = build_result["payload"]
+            debug_info = build_result["debug_info"]
+
+            # 注入上下文到 meta，供 drafting step 使用
+            scene_node.meta["dynamic_context"] = context_payload
+
+            # 记录上下文组装日志 (Traceability)
+            log_event(
+                jsonl,
+                {
+                    "ts": datetime.datetime.now().isoformat(),
+                    "run_id": self.run_id,
+                    "step": step_name,
+                    "event": "CONTEXT_ASSEMBLED",
+                    "scene_id": scene_node.id,
+                    "debug_info": debug_info,
+                },
+            )
 
             # 计算目标路径
             rel_path = f"04_drafting/scenes/scene_{scene_node.id:03d}.md"
@@ -276,6 +312,29 @@ class ProjectManager:
                         jsonl=jsonl,
                         run_id=self.run_id,
                     )
+
+                    # === Phase 2.2: 记忆维护 (Compaction) ===
+                    log.info(f"Updating memory for Scene {scene_node.id}...")
+
+                    # A. 生成摘要 (Episodic Memory)
+                    summary = wiki_updater.summarize(content)
+                    scene_node.summary = summary
+
+                    # 记录记忆更新日志
+                    log_event(
+                        jsonl,
+                        {
+                            "ts": datetime.datetime.now().isoformat(),
+                            "run_id": self.run_id,
+                            "step": step_name,
+                            "event": "MEMORY_UPDATED",
+                            "scene_id": scene_node.id,
+                            "new_summary_preview": summary[:50] + "...",
+                        },
+                    )
+
+                    # B. 更新 Bible (TODO: 可选，如每N章更新一次)
+                    # new_bible = wiki_updater.update_bible(...)
 
                     # 成功后更新状态
                     scene_node.status = "done"
