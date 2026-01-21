@@ -1,197 +1,8 @@
 # src/pipeline/step_04_drafting.py
-import json
 import os
-import datetime
-from typing import Dict, Any, List, Optional
-
-from utils.logger import log_event, StepTimer
-
-
-def _safe_int(v, default: int) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def build_scene_plan_prompt(outline_md: str, bible_yaml: str, max_scenes: int) -> str:
-    return (
-        "你是中文男频修仙中短篇的“场景拆分器”。必须遵守：单女主。\n"
-        "请根据【大纲】与【角色圣经】，拆分为可写作的场景列表。\n"
-        "只输出严格 JSON（不要代码块，不要解释）。\n\n"
-        "JSON 结构：\n"
-        "{\n"
-        '  "scenes": [\n'
-        "    {\n"
-        '      "id": 1,\n'
-        '      "title": "场景标题",\n'
-        '      "goal": "本场目标",\n'
-        '      "conflict": "冲突点",\n'
-        '      "turn": "转折/信息增量",\n'
-        '      "cliffhanger": "结尾钩子",\n'
-        '      "characters": ["出场人物名1", "名2"],\n'
-        '      "location": "地点",\n'
-        '      "time": "时间/阶段"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        f"要求：\n"
-        f"1) 场景数量 <= {max_scenes}\n"
-        "2) 节奏快：每个场景必须有冲突推进与信息增量\n"
-        "3) 单女主：女主的关系推进节点要出现在多个关键场景，但不得喧宾夺主\n"
-        "4) 尽量让场景标题具有网文吸引力\n\n"
-        "【大纲】\n"
-        f"{outline_md}\n\n"
-        "【角色圣经】\n"
-        f"{bible_yaml}\n"
-    )
-
-
-def build_scene_draft_prompt(
-    scene: Dict[str, Any], outline_md: str, bible_yaml: str, scene_words: int
-) -> str:
-    # 提取动态上下文（Phase 2 新增）
-    dynamic_ctx = scene.get("dynamic_context", {})
-    story_so_far = dynamic_ctx.get("story_so_far", "")
-    prev_text = dynamic_ctx.get("previous_text_tail", "")
-
-    return (
-        "你是中文男频修仙中短篇写作助手。必须原创，必须单女主。\n"
-        "请根据【场景卡】写一个完整场景，输出 Markdown。\n\n"
-        f"硬性要求：\n"
-        f"1) 字数约 {scene_words} 字（允许±25%）\n"
-        "2) 强画面感 + 对白推进冲突\n"
-        "3) 必须落实本场 goal/conflict/turn/cliffhanger\n"
-        "4) 不得出现多女主暧昧倾向\n"
-        "5) 保持人物性格一致（参考角色圣经）\n\n"
-        "输出格式：\n"
-        f"# Scene {scene.get('id')}: {scene.get('title','')}\n"
-        "- 目标：...\n"
-        "- 冲突：...\n"
-        "- 转折：...\n"
-        "- 钩子：...\n"
-        "\n"
-        "正文正文正文...\n\n"
-        "【场景卡】\n"
-        f"{json.dumps(scene, ensure_ascii=False)}\n\n"
-        "【前情提要 (Story So Far)】\n"
-        "这里是之前章节发生的故事摘要，请确保剧情连贯：\n"
-        f"{story_so_far}\n\n"
-        "【上文衔接 (Immediate Context)】\n"
-        "这是上一章的结尾，请在文风和动作上无缝衔接（不要重复这段文字）：\n"
-        f"{prev_text}\n\n"
-        "【大纲】\n"
-        f"{outline_md}\n\n"
-        "【角色圣经】\n"
-        f"{bible_yaml}\n"
-    )
-
-
-def _parse_scene_plan(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        l = text.find("{")
-        r = text.rfind("}")
-        if l != -1 and r != -1 and r > l:
-            return json.loads(text[l : r + 1])
-        raise
-
-
-def generate_scene_plan(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """生成分场大纲（包含 JSON Mode 支持与详细日志）"""
-    cfg = step_ctx["cfg"]
-    prompts = step_ctx["prompts"]
-    provider = step_ctx["provider"]
-    store = step_ctx["store"]
-
-    # 获取上下文
-    outline_path = step_ctx["outline_path"]
-    bible_path = step_ctx["bible_path"]
-    run_id = step_ctx.get("run_id", "-")
-    jsonl = step_ctx.get("jsonl")
-    log = step_ctx.get("log")
-
-    with open(outline_path, "r", encoding="utf-8") as f:
-        outline_md = f.read()
-    with open(bible_path, "r", encoding="utf-8") as f:
-        bible_yaml = f.read()
-
-    system = prompts.get("global_system", "").strip()
-
-    # === 核心修改：动态计算章节数 (Phase 2) ===
-    # 废弃旧的 max_scenes 读取逻辑
-    # drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
-    # max_scenes = int(drafting_cfg.get("max_scenes", 12))
-
-    len_cfg = cfg.get("content", {}).get("length", {})
-    # 兼容新旧配置键名
-    total_words = int(
-        len_cfg.get("target_total_words") or len_cfg.get("target_words", 50000)
-    )
-    avg_words = int(len_cfg.get("avg_chapter_words", 3000))
-
-    # 向上取整计算目标章节数
-    target_scenes = (total_words + avg_words - 1) // avg_words
-
-    # 限制 LLM 一次生成的上限
-    max_scenes_limit = 60
-
-    # === 关键：这里必须使用计算出的 effective_scenes ===
-    effective_scenes = min(target_scenes, max_scenes_limit)
-
-    if log:
-        log.info(
-            f"Length Control: Target {total_words} words / {avg_words} per chapter = {target_scenes} scenes."
-        )
-        log.info(f"Generating scene plan for {effective_scenes} scenes.")
-
-    # 使用 effective_scenes 构建 Prompt
-    plan_prompt = build_scene_plan_prompt(outline_md, bible_yaml, effective_scenes)
-
-    t_plan = StepTimer()
-
-    # --- 核心逻辑升级：支持 generate_json ---
-    if hasattr(provider, "generate_json"):
-        plan_text, plan_obj = provider.generate_json(
-            system=system, prompt=plan_prompt, meta={"cfg": cfg}
-        )
-    else:
-        plan_text = provider.generate(
-            system=system, prompt=plan_prompt, meta={"cfg": cfg}
-        ).text
-        plan_obj = _parse_scene_plan(plan_text)
-
-    plan_ms = t_plan.ms()
-
-    # 保存原始输出（Debug用）
-    store.save_text("04_drafting/scene_plan_raw.txt", plan_text)
-
-    # 记录详细日志
-    log_event(
-        jsonl,
-        {
-            "ts": datetime.datetime.now().isoformat(),
-            "run_id": run_id,
-            "step": "drafting",
-            "event": "MODEL_CALL",
-            "subtype": "scene_plan",
-            "duration_ms": plan_ms,
-            "prompt_preview": plan_prompt[:240],
-        },
-    )
-
-    scenes = plan_obj.get("scenes", [])
-    if not isinstance(scenes, list):
-        scenes = []
-
-    # 截断与回填 (以 effective_scenes 为准)
-    scenes = scenes[:effective_scenes]
-    plan_obj["scenes"] = scenes
-
-    path = store.save_json("04_drafting/scene_plan.json", plan_obj)
-    return {"scene_plan_path": path, "scenes": scenes}
+import time
+from typing import Dict, Any, Optional
+from jinja2 import Template
 
 
 def draft_single_scene(
@@ -201,94 +12,93 @@ def draft_single_scene(
     provider: Any,
     outline_path: str,
     bible_path: str,
-    store: Any,  # 新增：为了流式写文件
-    rel_path: str,  # 新增：目标文件路径
-    log: Any = None,  # 新增
-    jsonl: Any = None,  # 新增
-    run_id: str = "-",  # 新增
+    store: Any,
+    rel_path: str,
+    log: Any = None,
+    jsonl: Any = None,
+    run_id: str = "",
 ) -> str:
-    """原子函数：写单个场景（支持流式写入与断点续传）"""
+    """
+    Step 04b: 单场景正文生成 (原子函数)
 
-    with open(outline_path, "r", encoding="utf-8") as f:
-        outline_md = f.read()
-    with open(bible_path, "r", encoding="utf-8") as f:
-        bible_yaml = f.read()
+    该函数由 WorkflowEngine 调用，支持：
+    1. Jinja2 Prompt 渲染 (注入 ContextBuilder 构建的 dynamic_context)
+    2. 流式生成与实时文件写入
+    3. 返回完整文本供后续处理
+    """
 
-    system = prompts.get("global_system", "").strip()
+    # 1. 准备上下文
+    # Manager 已经在 run_drafting_loop 中调用 ContextBuilder 并注入到了 scene_data["dynamic_context"]
+    # 这里的 scene_data 就是 SceneNode.meta
+    render_ctx = scene_data.get("dynamic_context", {})
 
-    # 计算单章字数目标
-    len_cfg = cfg.get("content", {}).get("length", {})
-    # 优先使用 avg_chapter_words，回退使用旧的 drafting.scene_words
-    drafting_cfg = (cfg.get("pipeline", {}) or {}).get("drafting", {}) or {}
-    scene_words = int(
-        len_cfg.get("avg_chapter_words") or drafting_cfg.get("scene_words", 3000)
-    )
+    # 如果缺少动态上下文（比如单独调试时），尝试简单的回退
+    if not render_ctx:
+        if log:
+            log.warning("Missing dynamic_context in scene_data, using fallback.")
+        render_ctx = {
+            "bible": "（未加载设定集）",
+            "outline": "（未加载大纲）",
+            "prev_context": "（无前情提要）",
+            "scene_id": scene_data.get("id", "?"),
+            "scene_title": scene_data.get("title", "Unknown"),
+            "scene_meta": scene_data,
+        }
 
-    # 构建包含动态上下文的 Prompt
-    scene_prompt = build_scene_draft_prompt(
-        scene_data, outline_md, bible_yaml, scene_words
-    )
+    # 2. 渲染 Prompt
+    writer_tpl = prompts.get("drafting", {}).get("writer", "")
+    if not writer_tpl:
+        # Fallback prompt
+        writer_tpl = "请根据以下细纲写出正文：\n{{ scene_meta.summary }}"
 
-    t_scene = StepTimer()
-
-    # 2. 准备原子写入
-    # 使用 .part 文件，避免写了一半程序崩溃导致文件损坏
-    part_rel_path = rel_path + ".part"
-    part_abs_path, f_handle = store.open_text(part_rel_path, mode="w")
-
-    collected = []
     try:
-        # --- 核心逻辑升级：支持流式生成 ---
-        if hasattr(provider, "stream_generate"):
-            # 流式调用
-            for chunk in provider.stream_generate(
-                system=system,
-                prompt=scene_prompt,
-                meta={"cfg": cfg, "scene": scene_data},
-            ):
-                f_handle.write(chunk)
-                f_handle.flush()  # 实时刷盘
-                collected.append(chunk)
-        else:
-            # 非流式回退
-            txt = provider.generate(
-                system=system,
-                prompt=scene_prompt,
-                meta={"cfg": cfg, "scene": scene_data},
-            ).text
-            f_handle.write(txt)
-            collected.append(txt)
+        user_prompt = Template(writer_tpl).render(**render_ctx)
     except Exception as e:
         if log:
-            log.error(f"Error drafting scene {scene_data.get('id')}: {e}")
-        f_handle.close()
+            log.error(f"Template rendering failed: {e}")
+        user_prompt = f"Prompt Render Error: {e}\n\nContext: {scene_data}"
+
+    sys_tpl = prompts.get("global_system", "")
+    system_prompt = Template(sys_tpl).render(**render_ctx)
+
+    # 3. 准备输出路径
+    # rel_path 由 WorkflowEngine 传入，可能是 "04_drafting/scenes/scene_001_v1.md"
+    abs_path = store._abs(rel_path)
+    # 确保存储目录存在
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+    if log:
+        log.info(f"Drafting scene to {rel_path} ...")
+
+    # 4. 执行生成 (流式)
+    full_text = ""
+    start_time = time.time()
+
+    try:
+        with open(abs_path, "w", encoding="utf-8") as f:
+            # 写入文件头 (可选，方便阅读)
+            header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
+            f.write(header)
+
+            if hasattr(provider, "stream_generate"):
+                for chunk in provider.stream_generate(
+                    system=system_prompt,
+                    prompt=user_prompt,
+                    meta={"scene_id": render_ctx.get("scene_id")},
+                ):
+                    f.write(chunk)
+                    f.flush()
+                    full_text += chunk
+            else:
+                text = provider.generate(system=system_prompt, prompt=user_prompt).text
+                f.write(text)
+                full_text = text
+
+    except Exception as e:
+        if log:
+            log.error(f"Generation failed for {rel_path}: {e}")
         raise e
-    finally:
-        f_handle.close()
 
-    scene_ms = t_scene.ms()
-    full_text = "".join(collected)
-
-    # 3. 原子替换 (rename .part -> .md)
-    final_abs_path = store._abs(rel_path)
-    if os.path.exists(final_abs_path):
-        os.remove(final_abs_path)  # Windows下replace不能覆盖已有文件，需先删
-    os.replace(part_abs_path, final_abs_path)
-
-    # 4. 记录日志
-    log_event(
-        jsonl,
-        {
-            "ts": datetime.datetime.now().isoformat(),
-            "run_id": run_id,
-            "step": "drafting",
-            "event": "MODEL_CALL",
-            "subtype": "scene_draft",
-            "scene_index": scene_data.get("id"),
-            "duration_ms": scene_ms,
-            "prompt_preview": scene_prompt[:240],
-            "artifact_path": final_abs_path,
-        },
-    )
-
+    # 5. 返回结果
+    # 注意：WorkflowEngine 需要纯正文文本来计算长度等，这里我们返回完整内容
     return full_text

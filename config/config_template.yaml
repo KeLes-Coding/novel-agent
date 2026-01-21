@@ -9,6 +9,7 @@ content:
     - "修仙"
     - "单女主"
   # 你随时改这里的 tags，Agent 自动生效
+  num_ideas: 5
   length:
     # 核心控制参数
     target_total_words: 30000   # 目标总字数 (例如 20万字)
@@ -80,3 +81,15 @@ logging:
   include_prompt_preview: true
   prompt_preview_chars: 240
   pii_scrub: true
+
+notification:
+  enabled: true
+  # 支持列表格式，同时启用 console 和 popup
+  method: ["console", "popup"]
+  webhook_url: ""
+
+workflow:
+  interactive: true
+  branching:
+    enabled: true
+    num_candidates: 2

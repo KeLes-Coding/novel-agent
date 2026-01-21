@@ -5,29 +5,57 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Any
 
 
+# 复用之前的 SceneCandidate
+@dataclass
+class ArtifactCandidate:
+    """通用的候选项 (用于创意、大纲等)"""
+
+    id: str
+    content: str  # 内容直接存文本，或者存路径
+    score: float = 0.0
+    critique: str = ""
+    selected: bool = False
+
+
+@dataclass
+class SceneCandidate:
+    id: str
+    content_path: str
+    summary: str = ""
+    score: float = 0.0
+    critique: str = ""
+    selected: bool = False
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class SceneNode:
     id: int
     title: str
-    status: str = "pending"
+    status: str = "pending"  # pending, drafting, review, done
     content_path: str = ""
-    # === 新增 ===
-    summary: str = ""  # 本章剧情摘要 (Episodic Memory)
-    characters_involved: List[str] = field(
-        default_factory=list
-    )  # 本章出场人物 (用于索引)
-    # ============
+    summary: str = ""
+    characters_involved: List[str] = field(default_factory=list)
+
+    # A/B 测试与 HITL 支持
+    candidates: List[SceneCandidate] = field(default_factory=list)
+    selected_candidate_id: Optional[str] = None
+
     version: int = 1
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class ProjectState:
-    """整个项目的状态快照"""
-
     run_id: str
     run_dir: str
-    step: str = "init"  # ideation, outline, bible, drafting, done
+    step: str = "init"
+
+    # === 新增：人机交互状态控制 ===
+    # status: "idle", "running", "paused_for_input"
+    system_status: str = "idle"
+    # 记录当前阻塞在哪一步，等待什么类型的输入
+    pending_action: Optional[Dict[str, Any]] = None
 
     # 关键工件路径
     idea_path: str = ""
@@ -35,21 +63,22 @@ class ProjectState:
     bible_path: str = ""
     scene_plan_path: str = ""
 
-    # 场景列表（有序）
-    scenes: List[SceneNode] = field(default_factory=list)
+    # === 新增：全局步骤的候选项存储 ===
+    idea_candidates: List[ArtifactCandidate] = field(default_factory=list)
+    outline_candidates: List[ArtifactCandidate] = field(default_factory=list)
+    bible_candidates: List[ArtifactCandidate] = field(default_factory=list)
+    scene_plan_candidates: List[ArtifactCandidate] = field(default_factory=list)
 
-    # 全局元数据
+    scenes: List[SceneNode] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def save(self):
-        """保存状态到 run_dir/state.json"""
         path = os.path.join(self.run_dir, "state.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=2, ensure_ascii=False)
 
     @classmethod
     def load(cls, run_dir: str) -> "ProjectState":
-        """从文件加载状态"""
         path = os.path.join(run_dir, "state.json")
         if not os.path.exists(path):
             raise FileNotFoundError(f"State file not found at {path}")
@@ -57,8 +86,27 @@ class ProjectState:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # 反序列化 SceneNode
+        # 反序列化处理
         scenes_data = data.pop("scenes", [])
+
+        # 处理新增字段的向后兼容
+        idea_cands = data.pop("idea_candidates", [])
+        outline_cands = data.pop("outline_candidates", [])
+        bible_cands = data.pop("bible_candidates", [])
+
         state = cls(**data)
-        state.scenes = [SceneNode(**s) for s in scenes_data]
+
+        # 恢复 Scenes
+        state.scenes = []
+        for s_data in scenes_data:
+            cands_data = s_data.pop("candidates", [])
+            node = SceneNode(**s_data)
+            node.candidates = [SceneCandidate(**c) for c in cands_data]
+            state.scenes.append(node)
+
+        # 恢复 Global Candidates
+        state.idea_candidates = [ArtifactCandidate(**c) for c in idea_cands]
+        state.outline_candidates = [ArtifactCandidate(**c) for c in outline_cands]
+        state.bible_candidates = [ArtifactCandidate(**c) for c in bible_cands]
+
         return state

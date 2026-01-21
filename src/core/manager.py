@@ -3,19 +3,28 @@ import os
 import datetime
 import uuid
 import yaml
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
+import re
 
 from utils.logger import RunContext, setup_loggers, StepTimer, LogAdapter, log_event
 from utils.trace_logger import TraceLogger, TracingProvider
 from utils.hashing import sha256_text, sha256_file
 from providers.factory import build_provider
 from storage.local_store import LocalStore
-from core.state import ProjectState, SceneNode
+
+# === 修改点 1: 引入 ArtifactCandidate ===
+from core.state import ProjectState, SceneNode, ArtifactCandidate
 
 # 引入 Pipeline Steps
+from pipeline.step_01_ideation import run as run_ideation
 from pipeline.step_02_outline import run as run_outline
 from pipeline.step_03_bible import run as run_bible
 from pipeline.step_04_drafting import generate_scene_plan, draft_single_scene
+
+from utils.graph_parser import GraphParser
+
+# === 修改点 2: 引入 WorkflowEngine ===
+from core.workflow import WorkflowEngine
 
 
 class ProjectManager:
@@ -32,19 +41,17 @@ class ProjectManager:
             self.run_dir = None
 
             # 支持 Phase 1.5 的新命名结构 (runs/YYYY-MM-DD_HH-MM-SS_{uuid})
-            # 也兼容旧结构
             if os.path.exists(os.path.join(runs_dir, run_id)):
                 self.run_dir = os.path.join(runs_dir, run_id)
             else:
                 # 遍历寻找
                 for entry in os.listdir(runs_dir):
-                    # 检查是否包含该 run_id (新命名规则后缀包含 uuid)
                     if run_id in entry:
                         full_path = os.path.join(runs_dir, entry)
                         if os.path.isdir(full_path):
                             self.run_dir = full_path
                             break
-                    # 兼容旧的 date/run_id 结构
+                    # 兼容旧结构
                     candidate_sub = os.path.join(runs_dir, entry, run_id)
                     if os.path.exists(candidate_sub):
                         self.run_dir = candidate_sub
@@ -59,12 +66,10 @@ class ProjectManager:
 
         else:
             # === Phase 1.5: 目录结构规范化 ===
-            # 格式: runs/YYYY-MM-DD/HH-MM-SS_{short_uuid}
             now_str = datetime.datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
             short_uid = uuid.uuid4().hex[:8]
             self.run_id = f"{now_str}_{short_uid}"
 
-            # 直接放在 runs 目录下，不再按日期分层，方便排序
             self.run_dir = os.path.join(runs_dir, self.run_id)
             os.makedirs(self.run_dir, exist_ok=True)
 
@@ -77,15 +82,11 @@ class ProjectManager:
         self.store = LocalStore(self.run_dir)
 
         # === Phase 1.4: 全链路追踪集成 ===
-        # 1. 初始化 TraceLogger
         trace_path = os.path.join(self.run_dir, "logs", "llm_trace.jsonl")
         self.tracer = TraceLogger(trace_path)
 
-        # 2. 构建原始 Provider
         raw_provider = build_provider(self.config)
 
-        # 3. 包装 Provider
-        # 动态获取当前 step 的 lambda
         get_step = lambda: self.state.step
         self.provider = TracingProvider(
             raw_provider, self.tracer, self.run_id, get_step
@@ -101,7 +102,6 @@ class ProjectManager:
             return yaml.safe_load(f)
 
     def _setup_logging(self, resume: bool):
-        # 保持原有应用日志配置
         ctx = RunContext(
             run_id=self.run_id,
             run_dir=self.run_dir,
@@ -111,132 +111,368 @@ class ProjectManager:
         return setup_loggers(ctx)
 
     def run_ideation(self):
-        """执行创意生成 (Step 01)"""
+        """执行创意生成 (Step 01) - HITL 集成版 (Two-Layer Agent)"""
         step_name = "ideation"
         log = LogAdapter(
             self.logger_env["logger"], {"run_id": self.run_id, "step": step_name}
         )
 
-        log.info("Starting Ideation Step...")
-
-        tags = self.config["content"]["tags"]
-        genre = self.config["content"]["genre"]
-        target_words = self.config["content"]["length"].get(
-            "target_words", 200000
-        )  # 兼容新配置
-
-        ideation_prompt = (
-            self.prompts["ideation"].strip()
-            + f"\n\n约束：题材={genre}，tags={tags}，目标字数≈{target_words}"
+        workflow = WorkflowEngine(
+            {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "log": log,
+                "jsonl": self.logger_env["jsonl"],
+                "run_id": self.run_id,
+                "state": self.state,
+            }
         )
-        system = self.prompts.get("global_system", "").strip()
 
-        # 调用模型
-        t_call = StepTimer()
-        ideas_text = self.provider.generate(
-            system=system, prompt=ideation_prompt, meta={"cfg": self.config}
-        ).text
-        call_ms = t_call.ms()
+        log.info("Starting Ideation Step (2-Layer Agent Mode)...")
 
-        # 保存
-        path = self.store.save_text("01_ideation/ideas.txt", ideas_text)
+        def _generate_ideas() -> list:
+            ctx = {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "log": log,  # 传入 log 以便 pipeline 打印进度
+            }
+            from pipeline.step_01_ideation import run as pipe_run_ideation
 
-        # 更新状态
-        self.state.idea_path = path
+            # 执行两阶段生成
+            res = pipe_run_ideation(ctx)
+
+            # === 直接获取结构化候选项 ===
+            raw_candidates = res.get("candidates_list", [])
+
+            # 如果列表为空（回退逻辑）
+            if not raw_candidates:
+                log.warning(
+                    "Pipeline returned no structured candidates, fallback to text read."
+                )
+                full_text = res.get("idea_text", "")
+                if not full_text:
+                    path = res.get("idea_path", "")
+                    if path and os.path.exists(path):
+                        with open(path, "r", encoding="utf-8") as f:
+                            full_text = f.read()
+                return [ArtifactCandidate(id="v1_fallback", content=full_text)]
+
+            # 封装为 ArtifactCandidate
+            candidates = []
+            for i, text in enumerate(raw_candidates):
+                # 提取标题用于 ID（可选，这里简单用 v1, v2）
+                cid = f"v{i+1}"
+                candidates.append(ArtifactCandidate(id=cid, content=text))
+
+            return candidates
+
+        # 执行 HITL
+        selected = workflow.run_step_with_hitl(
+            step_name="ideation",
+            generate_fn=_generate_ideas,
+            candidates_field="idea_candidates",
+            selected_path_field="idea_path",
+        )
+
+        final_path = self.store.save_text(
+            "01_ideation/ideas_selected.txt", selected.content
+        )
+        self.state.idea_path = final_path
         self.state.step = "ideation"
         self.state.save()
 
-        log.info(f"Ideation saved to {path} (duration: {call_ms}ms)")
+        log.info(f"Ideation finalized: {final_path}")
 
     def run_outline(self):
-        """执行大纲生成 (Step 02)"""
+        """执行大纲生成 (Step 02) - HITL 集成版 (Two-Layer Agent)"""
         step_name = "outline"
         log = LogAdapter(
             self.logger_env["logger"], {"run_id": self.run_id, "step": step_name}
         )
 
+        workflow = WorkflowEngine(
+            {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "log": log,
+                "jsonl": self.logger_env["jsonl"],
+                "run_id": self.run_id,
+                "state": self.state,
+            }
+        )
+
         if not self.state.idea_path:
-            log.error("Missing idea_path! Cannot generate Outline.")
-            raise FileNotFoundError("idea_path is missing in state.")
+            log.error("Missing idea_path!")
+            return
 
-        log.info("Starting Outline Step...")
+        def _generate_outline() -> list:
+            ctx = {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "idea_path": self.state.idea_path,
+                "log": log,  # 传入 log
+            }
+            from pipeline.step_02_outline import run as pipe_run_outline
 
-        ctx = {
-            "cfg": self.config,
-            "prompts": self.prompts,
-            "provider": self.provider,
-            "store": self.store,
-            "idea_path": self.state.idea_path,
-        }
-        res = run_outline(ctx)
+            res = pipe_run_outline(ctx)
 
-        self.state.outline_path = res["outline_path"]
+            # === 获取候选项 ===
+            # Step 02 产生的 candidates_list 通常只有一个元素（完整大纲）
+            raw_candidates = res.get("candidates_list", [])
+
+            # 回退逻辑
+            if not raw_candidates:
+                content = res.get("outline_text", "")
+                if not content:
+                    path = res.get("outline_path", "")
+                    if path and os.path.exists(path):
+                        with open(path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                raw_candidates = [content] if content else []
+
+            candidates = []
+            for i, text in enumerate(raw_candidates):
+                # 默认大纲只有一版 v1，但如果未来支持并行生成多种风格大纲，这里自动兼容
+                cid = f"v{i+1}"
+                candidates.append(ArtifactCandidate(id=cid, content=text))
+
+            return candidates
+
+        # 执行 HITL
+        selected = workflow.run_step_with_hitl(
+            step_name="outline",
+            generate_fn=_generate_outline,
+            candidates_field="outline_candidates",
+            selected_path_field="outline_path",
+        )
+
+        final_path = self.store.save_text(
+            "02_outline/outline_selected.md", selected.content
+        )
+        self.state.outline_path = final_path
         self.state.step = "outline"
         self.state.save()
-        log.info(f"Outline saved to {self.state.outline_path}")
+        log.info(f"Outline finalized: {final_path}")
 
     def run_bible(self):
-        """执行设定集生成 (Step 03)"""
+        """执行设定集生成 (Step 03) - HITL 集成版"""
         step_name = "bible"
         log = LogAdapter(
             self.logger_env["logger"], {"run_id": self.run_id, "step": step_name}
+        )
+
+        workflow = WorkflowEngine(
+            {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "log": log,
+                "jsonl": self.logger_env["jsonl"],
+                "run_id": self.run_id,
+                "state": self.state,
+            }
         )
 
         if not self.state.outline_path:
             log.error("Missing outline! Cannot generate Bible.")
             return
 
-        log.info("Starting Bible Step...")
-        ctx = {
-            "cfg": self.config,
-            "prompts": self.prompts,
-            "provider": self.provider,
-            "store": self.store,
-            "outline_path": self.state.outline_path,
-        }
-        res = run_bible(ctx)
+        def _generate_bible() -> list:
+            ctx = {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "outline_path": self.state.outline_path,
+                "log": log,
+            }
+            from pipeline.step_03_bible import run as pipe_run_bible
 
-        self.state.bible_path = res["bible_path"]
+            res = pipe_run_bible(ctx)
+
+            # HITL 候选处理
+            raw_candidates = res.get("candidates_list", [])
+
+            # 回退逻辑
+            if not raw_candidates:
+                content = res.get("bible_text", "")
+                if not content:
+                    path = res.get("bible_path", "")
+                    if path and os.path.exists(path):
+                        with open(path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                raw_candidates = [content] if content else []
+
+            candidates = []
+            for i, text in enumerate(raw_candidates):
+                cid = f"v{i+1}"
+                candidates.append(ArtifactCandidate(id=cid, content=text))
+
+            return candidates
+
+        log.info("Starting Bible Step with HITL...")
+
+        selected = workflow.run_step_with_hitl(
+            step_name="bible",
+            generate_fn=_generate_bible,
+            candidates_field="bible_candidates",  # 需要在 state.py 增加这个字段
+            selected_path_field="bible_path",
+        )
+
+        final_path = self.store.save_text(
+            "03_bible/bible_selected.md", selected.content
+        )
+        self.state.bible_path = final_path
         self.state.step = "bible"
         self.state.save()
         log.info(f"Bible saved to {self.state.bible_path}")
 
     def init_scenes(self):
-        """Step 04a: 生成分场表"""
+        """Step 04a: 生成分场表 (HITL 集成版)"""
         step_name = "scene_plan"
         log = LogAdapter(
             self.logger_env["logger"], {"run_id": self.run_id, "step": step_name}
         )
 
-        log.info("Generating Scene Plan...")
-        plan_data = generate_scene_plan(
+        workflow = WorkflowEngine(
             {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "log": log,
+                "jsonl": self.logger_env["jsonl"],
+                "run_id": self.run_id,
+                "state": self.state,
+            }
+        )
+
+        if not self.state.outline_path:
+            log.error("Missing outline! Cannot generate Scene Plan.")
+            return
+
+        def _generate_scene_plan() -> list:
+            ctx = {
                 "cfg": self.config,
                 "prompts": self.prompts,
                 "provider": self.provider,
                 "store": self.store,
                 "outline_path": self.state.outline_path,
                 "bible_path": self.state.bible_path,
-                "log": log,  # 传入 log 以便打印 length control 信息
+                "log": log,
             }
+            # 引入新写的 pipeline
+            from pipeline.step_04_scene_plan import run as pipe_run_scene_plan
+
+            res = pipe_run_scene_plan(ctx)
+
+            # 获取文本内容
+            candidates_list = res.get("candidates_list", [])
+            if not candidates_list:
+                # Fallback
+                text = res.get("scene_plan_text", "")
+                candidates_list = [text] if text else []
+
+            candidates = []
+            for i, text in enumerate(candidates_list):
+                candidates.append(ArtifactCandidate(id=f"v{i+1}", content=text))
+
+            return candidates
+
+        log.info("Generating Scene Plan with HITL...")
+
+        # 1. 运行 HITL 生成与精修
+        selected = workflow.run_step_with_hitl(
+            step_name="scene_plan",
+            generate_fn=_generate_scene_plan,
+            candidates_field="scene_plan_candidates",
+            selected_path_field="scene_plan_path",
         )
 
-        self.state.scene_plan_path = plan_data["scene_plan_path"]
-        raw_scenes = plan_data["scenes"]
+        final_path = self.store.save_text(
+            "04_scene_plan/scene_plan_selected.md", selected.content
+        )
+        self.state.scene_plan_path = final_path
 
-        self.state.scenes = []
-        for s in raw_scenes:
-            node = SceneNode(
-                id=s.get("id"), title=s.get("title"), status="pending", meta=s
+        # 2. 解析最终选定的文本，转换为 SceneNode 对象
+        log.info("Parsing selected scene plan into SceneNodes...")
+        scenes = self._parse_scene_plan_text(selected.content)
+
+        if not scenes:
+            log.warning(
+                "Parsing failed or empty. Fallback to raw generation logic needed?"
             )
-            self.state.scenes.append(node)
+            # TODO: 可以考虑从 json 文件恢复，但为了由文本驱动，这里最好保证 parser 健壮
 
+        self.state.scenes = scenes
         self.state.step = "scene_plan"
         self.state.save()
+
         log.info(f"Initialized {len(self.state.scenes)} scenes.")
 
+    def _parse_scene_plan_text(self, text: str) -> List[SceneNode]:
+        """
+        从 Markdown 文本中解析出 SceneNode。
+        格式约定：
+        # <ID>. <Title>
+        > 梗概：<Summary>
+        ...
+        """
+        scenes = []
+        # 简单的正则匹配：匹配以 # 开头的行，提取 ID 和 Title
+        # 假设格式：# 1. 第一章 遭遇战
+        pattern = r"^#\s+(\d+)\.\s+(.*)$"
+
+        current_id = None
+        current_title = ""
+        current_summary = ""
+
+        lines = text.split("\n")
+        for line in lines:
+            line = line.strip()
+            match = re.match(pattern, line)
+            if match:
+                # 如果已经有上一个场景，先保存 (简化逻辑，暂不保存上一个的内容细纲到 meta，只存结构)
+                if current_id is not None:
+                    node = SceneNode(
+                        id=int(current_id),
+                        title=current_title,
+                        summary=current_summary,
+                        status="pending",
+                    )
+                    scenes.append(node)
+
+                # 开始新场景
+                current_id = match.group(1)
+                current_title = match.group(2)
+                current_summary = ""
+
+            elif line.startswith("> 梗概：") or line.startswith("> Summary:"):
+                current_summary = line.split("：", 1)[-1].strip()
+
+        # 保存最后一个
+        if current_id is not None:
+            node = SceneNode(
+                id=int(current_id),
+                title=current_title,
+                summary=current_summary,
+                status="pending",
+            )
+            scenes.append(node)
+
+        return scenes
+
     def run_drafting_loop(self):
-        """Step 04b: 循环生成正文（带自动重试机制 + 动态上下文）"""
+        """Step 04b: 循环生成正文（集成 WorkflowEngine 支持并行、A/B测试与 HITL）"""
         step_name = "drafting"
         log = LogAdapter(
             self.logger_env["logger"], {"run_id": self.run_id, "step": step_name}
@@ -247,35 +483,46 @@ class ProjectManager:
             log.warning("No scenes found. Run init_scenes() first.")
             return
 
-        # === Phase 2: 初始化动态记忆组件 ===
-        # 确保 core.context 和 agents.wiki_updater 已按计划实现
         from core.context import ContextBuilder
         from agents.wiki_updater import WikiUpdater
 
         ctx_builder = ContextBuilder(self.state, self.store)
-        # WikiUpdater 需要 provider 来进行摘要生成
         wiki_updater = WikiUpdater(self.provider, self.prompts.get("global_system", ""))
 
-        import time  # 引入时间模块用于冷却
+        # === 修改点 6: 初始化 WorkflowEngine 并传入 state ===
+        workflow = WorkflowEngine(
+            {
+                "cfg": self.config,
+                "prompts": self.prompts,
+                "provider": self.provider,
+                "store": self.store,
+                "log": log,
+                "jsonl": jsonl,
+                "run_id": self.run_id,
+                "state": self.state,  # 关键：让 drafting 过程也能访问 notify/pause 状态
+            }
+        )
+
+        import time
 
         for i, scene_node in enumerate(self.state.scenes):
-            # 检查状态，支持断点续传
+            # 检查状态，支持断点续传（如果之前暂停了，state 会保存，这里重新进入循环）
             if scene_node.status == "done":
                 log.info(f"Skipping Scene {scene_node.id} (Done)")
                 continue
 
             # === Phase 2.1: 动态构建上下文 ===
+            # === 关键：构建并注入上下文 ===
             log.info(f"Building context for Scene {scene_node.id}...")
-
-            # 使用 ContextBuilder 组装上下文
             build_result = ctx_builder.build(scene_node.id)
+
+            # 将构建好的 payload 注入到 node.meta，供 draft_single_scene 使用
+            scene_node.meta["dynamic_context"] = build_result["payload"]
             context_payload = build_result["payload"]
             debug_info = build_result["debug_info"]
 
-            # 注入上下文到 meta，供 drafting step 使用
             scene_node.meta["dynamic_context"] = context_payload
 
-            # 记录上下文组装日志 (Traceability)
             log_event(
                 jsonl,
                 {
@@ -288,70 +535,44 @@ class ProjectManager:
                 },
             )
 
-            # 计算目标路径
-            rel_path = f"04_drafting/scenes/scene_{scene_node.id:03d}.md"
+            try:
+                # === Phase 3: 调用 WorkflowEngine 执行生成 ===
+                # process_scene 内部需自行处理 HITL 逻辑（如并行生成 -> 通知用户选择）
+                # 传入 outline/bible 用于生成
+                workflow.process_scene(
+                    scene_node, self.state.outline_path, self.state.bible_path
+                )
 
-            # === 增加重试机制 ===
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    log.info(
-                        f"Drafting Scene {scene_node.id}: {scene_node.title} (Attempt {attempt+1}/{max_retries})"
-                    )
+                # === Phase 2.2: 记忆维护 (Compaction) ===
+                log.info(f"Updating memory for Scene {scene_node.id}...")
 
-                    content = draft_single_scene(
-                        scene_data=scene_node.meta,
-                        cfg=self.config,
-                        prompts=self.prompts,
-                        provider=self.provider,
-                        outline_path=self.state.outline_path,
-                        bible_path=self.state.bible_path,
-                        store=self.store,
-                        rel_path=rel_path,
-                        log=log,
-                        jsonl=jsonl,
-                        run_id=self.run_id,
-                    )
+                # 读取最终选定的内容 (process_scene 会确保 content_path 指向选定文件)
+                with open(scene_node.content_path, "r", encoding="utf-8") as f:
+                    final_text = f.read()
 
-                    # === Phase 2.2: 记忆维护 (Compaction) ===
-                    log.info(f"Updating memory for Scene {scene_node.id}...")
+                # A. 生成摘要
+                summary = wiki_updater.summarize(final_text)
+                scene_node.summary = summary
 
-                    # A. 生成摘要 (Episodic Memory)
-                    summary = wiki_updater.summarize(content)
-                    scene_node.summary = summary
+                log_event(
+                    jsonl,
+                    {
+                        "ts": datetime.datetime.now().isoformat(),
+                        "run_id": self.run_id,
+                        "step": step_name,
+                        "event": "MEMORY_UPDATED",
+                        "scene_id": scene_node.id,
+                        "new_summary_preview": summary[:50] + "...",
+                    },
+                )
 
-                    # 记录记忆更新日志
-                    log_event(
-                        jsonl,
-                        {
-                            "ts": datetime.datetime.now().isoformat(),
-                            "run_id": self.run_id,
-                            "step": step_name,
-                            "event": "MEMORY_UPDATED",
-                            "scene_id": scene_node.id,
-                            "new_summary_preview": summary[:50] + "...",
-                        },
-                    )
+                # 状态保存
+                self.state.save()
 
-                    # B. 更新 Bible (TODO: 可选，如每N章更新一次)
-                    # new_bible = wiki_updater.update_bible(...)
-
-                    # 成功后更新状态
-                    scene_node.status = "done"
-                    scene_node.content_path = self.store._abs(rel_path)
-                    self.state.save()
-                    break  # 跳出重试循环，进入下一章
-
-                except Exception as e:
-                    log.warning(f"Failed to draft scene {scene_node.id}: {e}")
-                    if attempt < max_retries - 1:
-                        log.info("Retrying in 5 seconds...")
-                        time.sleep(5)  # 冷却一下
-                    else:
-                        log.error(
-                            f"Scene {scene_node.id} failed after {max_retries} attempts."
-                        )
-                        raise e  # 重试耗尽，抛出异常终止程序
+            except Exception as e:
+                log.error(f"Failed to process Scene {scene_node.id}: {e}")
+                # 异常抛出，中断流程以便人工排查
+                raise e
 
         self.state.step = "drafting_done"
         self.state.save()
