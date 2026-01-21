@@ -3,27 +3,25 @@ import os
 import datetime
 import uuid
 import yaml
-from typing import Dict, Any, List, Optional
-import re
+import re  # === 新增：确保引入正则模块 ===
+from typing import Dict, Any, Optional, List
 
 from utils.logger import RunContext, setup_loggers, StepTimer, LogAdapter, log_event
 from utils.trace_logger import TraceLogger, TracingProvider
 from utils.hashing import sha256_text, sha256_file
 from providers.factory import build_provider
 from storage.local_store import LocalStore
-
-# === 修改点 1: 引入 ArtifactCandidate ===
 from core.state import ProjectState, SceneNode, ArtifactCandidate
 
 # 引入 Pipeline Steps
 from pipeline.step_01_ideation import run as run_ideation
 from pipeline.step_02_outline import run as run_outline
 from pipeline.step_03_bible import run as run_bible
-from pipeline.step_04_drafting import generate_scene_plan, draft_single_scene
+
+# === 修改点：移除 generate_scene_plan，只保留 draft_single_scene ===
+from pipeline.step_04_drafting import draft_single_scene
 
 from utils.graph_parser import GraphParser
-
-# === 修改点 2: 引入 WorkflowEngine ===
 from core.workflow import WorkflowEngine
 
 

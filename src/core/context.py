@@ -43,8 +43,6 @@ class ContextBuilder:
             raise ValueError(f"Scene {scene_id} not found in project state.")
 
         # 3. 获取前情提要 (Previous Context / Sliding Window)
-        # 简单逻辑：获取上一章的 Summary。
-        # 进阶逻辑(TODO)：获取前N章的 Summary + 关键伏笔。
         prev_context = ""
         prev_node = next((s for s in self.state.scenes if s.id == scene_id - 1), None)
         if prev_node and prev_node.summary:
@@ -54,8 +52,14 @@ class ContextBuilder:
         else:
             prev_context = "【开篇】：这是故事的第一章。"
 
+        # === FIX: 斩断循环引用 ===
+        # 创建 meta 的副本，并移除可能存在的旧 dynamic_context
+        # 否则：meta -> dynamic_context -> payload -> meta -> ... (无限递归)
+        safe_meta = scene_node.meta.copy()
+        if "dynamic_context" in safe_meta:
+            del safe_meta["dynamic_context"]
+
         # 4. 组装 Payload
-        # 这个字典将被传递给 Jinja2 模板
         payload = {
             # 全局背景
             "idea": idea_text,
@@ -66,7 +70,7 @@ class ContextBuilder:
             # 当前任务信息
             "scene_id": scene_node.id,
             "scene_title": scene_node.title,
-            "scene_meta": scene_node.meta,  # 包含 goal, conflict 等
+            "scene_meta": safe_meta,  # 使用安全的副本
         }
 
         # 5. 返回构建结果与调试信息
@@ -84,23 +88,19 @@ class ContextBuilder:
     def _load_best_content(self, folder: str, candidates: List[str]) -> str:
         """
         尝试按顺序加载候选文件，返回第一个存在的文件的内容。
-        这确保了我们总是使用用户精修过（_selected）的版本。
         """
         for filename in candidates:
-            # 构造相对路径
             rel_path = f"{folder}/{filename}"
-            # 获取绝对路径用于检查
             abs_path = self.store._abs(rel_path)
 
             if os.path.exists(abs_path):
                 try:
                     with open(abs_path, "r", encoding="utf-8") as f:
                         content = f.read().strip()
-                        if content:  # 确保内容不为空
+                        if content:
                             return content
                 except Exception as e:
-                    # 仅记录日志或忽略，继续尝试下一个
                     print(f"[ContextBuilder] Error reading {filename}: {e}")
                     continue
 
-        return ""  # 如果都没找到，返回空字符串
+        return ""
