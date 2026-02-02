@@ -3,82 +3,72 @@ import argparse
 import sys
 import os
 
-# 获取当前脚本所在目录
+# Path setup
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# 拼接 src 目录路径
 src_path = os.path.join(current_dir, "src")
-# 加入系统路径
 sys.path.append(src_path)
 
 from core.manager import ProjectManager
-
+from interfaces.cli import CLIInterface
 
 def main():
-    parser = argparse.ArgumentParser(description="Novel Agent CLI")
+    parser = argparse.ArgumentParser(description="Novel Agent CLI 中文版 (v2.1)")
     parser.add_argument(
-        "--config", default="config/config.yaml", help="Path to config file"
+        "--config", default="config/config.yaml", help="配置文件路径"
     )
-    parser.add_argument("--run-id", help="Resume an existing run ID")
+    parser.add_argument("--run-id", help="恢复已有的运行 ID")
     parser.add_argument(
         "--step",
         choices=["ideation", "outline", "bible", "plan", "draft"],
-        help="Execute a specific step",
+        help="执行特定步骤 (这将强制跳转状态)",
     )
     parser.add_argument(
-        "--auto", action="store_true", help="Run full pipeline automatically"
+        "--rollback",
+        choices=["ideation", "outline", "bible", "plan"],
+        help="回退到指定阶段 (Backtracking)",
+    )
+    parser.add_argument(
+        "--auto", action="store_true", help="自动执行 (基于当前状态推进)"
     )
 
     args = parser.parse_args()
 
+    # 初始化界面
+    cli = CLIInterface()
+
     # 初始化管理器
     try:
-        manager = ProjectManager(config_path=args.config, run_id=args.run_id)
+        manager = ProjectManager(config_path=args.config, interface=cli, run_id=args.run_id)
     except Exception as e:
         import traceback
-
         traceback.print_exc()
-        print(f"Error initializing project: {e}")
+        cli.notify("致命错误", f"项目初始化失败: {e}")
         sys.exit(1)
 
-    print(f"🚀 Project: {manager.run_id} | Dir: {manager.run_dir}")
+    cli.notify("项目状态", f"项目 ID: {manager.run_id}\n当前阶段: {manager.fsm.current_phase.value}", {"存储目录": manager.run_dir})
 
-    if args.auto:
-        print("⚡ Auto mode initiated...")
-
-        # 1. 创意阶段
-        if not manager.state.idea_path:
-            print(">> Running Ideation...")
-            manager.run_ideation()
+    if args.rollback:
+        # 映射别名到 Enum 值
+        mapping = {
+            "ideation": "ideation",
+            "outline": "outline",
+            "bible": "bible",
+            "plan": "scene_plan"
+        }
+        target = mapping.get(args.rollback, args.rollback)
+        if cli.confirm(f"警告：你确定要回退到 [{target}] 阶段吗？这只是重置状态，不会删除文件，但后续生成可能会覆盖现有内容。"):
+            manager.rollback(target)
         else:
-            print(f"✓ Ideation done: {manager.state.idea_path}")
+            cli.notify("取消", "回退操作已取消。")
 
-        # 2. 大纲阶段
-        if not manager.state.outline_path:
-            print(">> Running Outline...")
-            manager.run_outline()
-        else:
-            print(f"✓ Outline done: {manager.state.outline_path}")
-
-        # 3. 设定集阶段
-        if not manager.state.bible_path:
-            print(">> Running Bible...")
-            manager.run_bible()
-        else:
-            print(f"✓ Bible done: {manager.state.bible_path}")
-
-        # 4. 分场阶段
-        if not manager.state.scenes:
-            print(">> Initializing Scenes...")
-            manager.init_scenes()
-        else:
-            print(f"✓ Scenes initialized: {len(manager.state.scenes)} scenes")
-
-        # 5. 正文阶段
-        print(">> Running Drafting Loop...")
-        manager.run_drafting_loop()
+    elif args.auto:
+        cli.notify("模式", "启动自动推进模式...")
+        try:
+            manager.execute_next_step()
+        except Exception as e:
+            cli.notify("执行中断", str(e))
 
     elif args.step:
-        # 手动单步模式
         if args.step == "ideation":
             manager.run_ideation()
         elif args.step == "outline":
@@ -88,11 +78,11 @@ def main():
         elif args.step == "plan":
             manager.init_scenes()
         elif args.step == "draft":
-            manager.run_drafting_loop()
+            manager.run_drafting_loop(auto_mode=args.auto)
 
     else:
-        print("Please specify --step or --auto")
-
+        if not args.rollback:
+            print("请指定 --step <步骤名> 或 --auto 或 --rollback")
 
 if __name__ == "__main__":
     main()

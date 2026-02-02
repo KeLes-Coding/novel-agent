@@ -44,6 +44,35 @@ class SceneNode:
     version: int = 1
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    # === Phase 3: 分支支持 ===
+    parent_id: Optional[int] = None
+    branches: List["SceneNode"] = field(default_factory=list)
+    preconditions: str = ""  # 进入此分支的条件 (自然语言或逻辑表达式)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """递归序列化"""
+        data = asdict(self)
+        # 处理 branches 递归
+        data["branches"] = [b.to_dict() for b in self.branches]
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SceneNode":
+        """递归反序列化"""
+        cands_data = data.pop("candidates", [])
+        branches_data = data.pop("branches", [])
+        
+        # 实例化自身
+        node = cls(**data)
+        
+        # 恢复 Candidates
+        node.candidates = [SceneCandidate(**c) for c in cands_data]
+        
+        # 恢复 Branches (递归调用)
+        node.branches = [cls.from_dict(b) for b in branches_data]
+        
+        return node
+
 
 @dataclass
 class ProjectState:
@@ -74,8 +103,12 @@ class ProjectState:
 
     def save(self):
         path = os.path.join(self.run_dir, "state.json")
+        # 使用自定义的 to_dict 逻辑处理嵌套
+        data = asdict(self)
+        data["scenes"] = [s.to_dict() for s in self.scenes]
+        
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(asdict(self), f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False)
 
     @classmethod
     def load(cls, run_dir: str) -> "ProjectState":
@@ -96,13 +129,10 @@ class ProjectState:
 
         state = cls(**data)
 
-        # 恢复 Scenes
+        # 恢复 Scenes (使用递归的 from_dict)
         state.scenes = []
         for s_data in scenes_data:
-            cands_data = s_data.pop("candidates", [])
-            node = SceneNode(**s_data)
-            node.candidates = [SceneCandidate(**c) for c in cands_data]
-            state.scenes.append(node)
+            state.scenes.append(SceneNode.from_dict(s_data))
 
         # 恢复 Global Candidates
         state.idea_candidates = [ArtifactCandidate(**c) for c in idea_cands]
