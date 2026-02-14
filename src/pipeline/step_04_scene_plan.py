@@ -1,11 +1,10 @@
 # src/pipeline/step_04_scene_plan.py
+from typing import Dict, Any, List
 import os
 import json
-import re
-from typing import Dict, Any, List
 from jinja2 import Template
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from utils.json_utils import extract_json
 
 def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -33,11 +32,12 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         with open(bible_path, "r", encoding="utf-8") as f:
             bible_summary = f.read()[:3000]
 
-    # 估算场次数量 (例如：总字数 / 3000字每章)
+    # 估算场次数量
+    avg_chapter_words = cfg.get("content", {}).get("length", {}).get("avg_chapter_words", 3000)
     target_words = (
         cfg.get("content", {}).get("length", {}).get("target_total_words", 200000)
     )
-    est_scenes = max(10, int(target_words / 3000))
+    est_scenes = max(10, int(target_words / avg_chapter_words))
 
     render_ctx = {
         "outline_context": outline_context,
@@ -63,34 +63,40 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     prompt_p1 = Template(extract_tpl).render(**render_ctx)
 
     json_path = f"{base_dir}/01_scene_list.json"
-    full_json_str = ""
-
-    with open(store._abs(json_path), "w", encoding="utf-8") as f:
-        if hasattr(provider, "stream_generate"):
-            for chunk in provider.stream_generate(
-                system=system_prompt, prompt=prompt_p1
-            ):
-                f.write(chunk)
-                f.flush()
-                full_json_str += chunk
-        else:
-            full_json_str = provider.generate(
-                system=system_prompt, prompt=prompt_p1
-            ).text
-            f.write(full_json_str)
-
-    # 解析 JSON
-    raw_json = re.sub(r"^```json", "", full_json_str.strip(), flags=re.MULTILINE)
-    raw_json = re.sub(r"^```", "", raw_json, flags=re.MULTILINE)
-
-    try:
-        scene_list = json.loads(raw_json)
-        if not isinstance(scene_list, list):
-            raise ValueError("Output is not a list")
-    except Exception as e:
-        if log:
-            log.error(f"Layer 1 JSON Parse Failed: {e}")
-        raise RuntimeError("Failed to parse Scene List JSON.")
+    
+    scene_list = []
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            full_json_str = ""
+            if hasattr(provider, "stream_generate"):
+                buffer = []
+                for chunk in provider.stream_generate(
+                    system=system_prompt, prompt=prompt_p1
+                ):
+                    buffer.append(chunk)
+                full_json_str = "".join(buffer)
+            else:
+                full_json_str = provider.generate(
+                    system=system_prompt, prompt=prompt_p1
+                ).text
+            
+            # Parse
+            scene_list = extract_json(full_json_str)
+            if not isinstance(scene_list, list):
+                raise ValueError("Output is not a list")
+            
+            # Success - Save raw
+            with open(store._abs(json_path), "w", encoding="utf-8") as f:
+                f.write(full_json_str)
+            break
+            
+        except Exception as e:
+            if log:
+                log.warning(f"Layer 1 JSON Parse Attempt {attempt+1}/{max_retries} Failed: {e}")
+            if attempt == max_retries - 1:
+                raise RuntimeError("Failed to parse Scene List JSON after retries.") from e
 
     if log:
         log.info(f"Layer 1 complete. Defined {len(scene_list)} scenes.")
@@ -202,6 +208,10 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     final_path = f"{base_dir}/scene_plan.md"
     store.save_text(final_path, final_full_text)
 
+    # 保存 JSON
+    final_json_path = f"{base_dir}/scene_plan.json"
+    store.save_json(final_json_path, scene_list)
+
     # 返回给 Manager
     # 注意：Manager 需要根据 candidates_list 里的文本解析出 SceneNode
     candidate_content = f"# 全书分场表\n\n{full_plan_text}"
@@ -209,6 +219,7 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "scene_plan_path": store._abs(final_path),
         "scene_plan_text": final_full_text,
+        "scene_plan_json_path": store._abs(final_json_path),
         "candidates_list": [candidate_content],
         "raw_scene_list": scene_list,  # 传递原始 JSON 供 Manager 兜底使用
     }

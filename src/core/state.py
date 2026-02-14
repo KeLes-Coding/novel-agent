@@ -98,6 +98,12 @@ class ProjectState:
     bible_candidates: List[ArtifactCandidate] = field(default_factory=list)
     scene_plan_candidates: List[ArtifactCandidate] = field(default_factory=list)
 
+    # === Phase 2: Memory Enhancement ===
+    # 归档的卷摘要列表 (List of Chapter Summaries)
+    archived_summaries: List[str] = field(default_factory=list)
+    # 最后一个已归档的场景 ID (Last scene ID included in archives)
+    last_archived_scene_id: int = 0
+
     scenes: List[SceneNode] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 

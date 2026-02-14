@@ -62,10 +62,22 @@ def main():
             cli.notify("取消", "回退操作已取消。")
 
     elif args.auto:
-        cli.notify("模式", "启动自动推进模式...")
+        cli.notify("模式", "启动自动推进模式 (按 Ctrl+C 终止)...")
         try:
-            manager.execute_next_step()
+            # 循环直到项目完成
+            while manager.state.step != "done":
+                manager.execute_next_step()
+                
+                # 可选：如果需要在步骤间暂停，可以在此添加 logic
+                # currently execute_next_step handles HITL internally, so we just loop.
+                
+            cli.notify("结束", "自动模式执行完毕。")
+            
+        except KeyboardInterrupt:
+            cli.notify("终止", "用户手动停止自动模式。")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             cli.notify("执行中断", str(e))
 
     elif args.step:

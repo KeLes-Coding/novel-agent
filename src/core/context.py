@@ -15,6 +15,16 @@ class ContextBuilder:
         self.state = state
         self.store = store
 
+    def _find_node_recursive(self, nodes: List[SceneNode], target_id: int) -> Optional[SceneNode]:
+        for node in nodes:
+            if node.id == target_id:
+                return node
+            if node.branches:
+                found = self._find_node_recursive(node.branches, target_id)
+                if found:
+                    return found
+        return None
+
     def build(self, scene_id: int) -> Dict[str, Any]:
         """
         为指定场景构建上下文
@@ -38,19 +48,42 @@ class ContextBuilder:
         )
 
         # 2. 定位当前场景节点
-        scene_node = next((s for s in self.state.scenes if s.id == scene_id), None)
+        scene_node = self._find_node_recursive(self.state.scenes, scene_id)
         if not scene_node:
             raise ValueError(f"Scene {scene_id} not found in project state.")
 
         # 3. 获取前情提要 (Previous Context / Sliding Window)
-        prev_context = ""
-        prev_node = next((s for s in self.state.scenes if s.id == scene_id - 1), None)
-        if prev_node and prev_node.summary:
-            prev_context = f"【上一章摘要】：{prev_node.summary}"
-        elif scene_id > 1:
-            prev_context = "【前情提要】：(暂无摘要，请根据大纲自行衔接)"
-        else:
-            prev_context = "【开篇】：这是故事的第一章。"
+        # 3. 获取前情提要 (Dynamic Memory Assembly)
+        # Structure: [History Arc] + [Recent Scenes]
+        
+        prev_context_parts = []
+        
+        # Part A: 历史长河 (Archived Chapter Summaries)
+        if self.state.archived_summaries:
+            history_text = "\n".join([f"- 卷{i+1}: {s}" for i, s in enumerate(self.state.archived_summaries)])
+            prev_context_parts.append(f"【往事回顾】(已归档剧情):\n{history_text}")
+            
+        # Part B: 近期记忆 (Active Scenes since last archive)
+        # Range: (last_archived_scene_id, current_scene_id - 1)
+        recent_summaries = []
+        start_recent = self.state.last_archived_scene_id + 1
+        end_recent = scene_id - 1
+        
+        if start_recent <= end_recent:
+             for sid in range(start_recent, end_recent + 1):
+                node = next((s for s in self.state.scenes if s.id == sid), None)
+                if node and node.summary:
+                    recent_summaries.append(f"- Scene {sid}: {node.summary}")
+        
+        if recent_summaries:
+            recent_text = "\n".join(recent_summaries)
+            prev_context_parts.append(f"【近期剧情】(未归档):\n{recent_text}")
+            
+        # Fallback for very first scene
+        if not prev_context_parts:
+            prev_context_parts.append("【开篇】：这是故事的第一章。")
+            
+        prev_context = "\n\n".join(prev_context_parts)
 
         # === FIX: 斩断循环引用 ===
         # 创建 meta 的副本，并移除可能存在的旧 dynamic_context

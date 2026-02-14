@@ -1,45 +1,33 @@
-# 测试框架开发总结
+# Walkthrough - Feature Completion & Documentation
 
-我已成功搭建了该项目的自动化测试框架，并验证了全部从真实运行数据中提取的测试用例。
+## 1. Hierarchical Memory & Dynamic World Building (Phase 2 Review)
+*(See previous section for implementation details)*
 
-所有测试相关文件均位于 `tests/` 目录下。
+## 2. Usability Improvements (Phase 3)
 
-## 1. 核心成果
+### CLI Flow Optimization
+- **Goal**: Enable fully automated end-to-end execution.
+- **Change**: Updated `main.py`'s `--auto` logic to use a `while` loop, continuously calling `manager.execute_next_step()` until the project phase reaches `done`.
+- **Usage**: `python main.py --auto` now runs the entire pipeline without stopping after each stage (unless manual input is required by design).
 
-### 数据提取工具
-- **`tests/extract_fixtures.py`**:
-    - 基于历史成功运行 (`runs/2026-01-15/16-55-35_b6901ee8`) 提取了完整的状态数据。
-    - 生成了 `tests/data/fixtures.json`，其中包含：
-        - 创意 (Ideation)
-        - 大纲 (Outline)
-        - 设定集 (Bible)
-        - 20 个已生成的正文场景 (Scenes)
+### Documentation
+I have created two new documentation files to assist developers and users:
 
-### 测试套件
-位于 `tests/` 目录，涵盖以下阶段：
-- **`test_01_ideation.py`**: 验证创意生成的 JSON 结构和 Markdown 格式。
-- **`test_02_outline.py`**: 验证大纲的分卷结构、标题及摘要。
-- **`test_03_bible.py`**: 验证世界观和角色设定字段。
-- **`test_04_drafting.py`**: 针对 20 个场景进行独立测试，验证内容长度和关键角色出现。
+#### [Project_Overview.md](file:///i:/WorkSpace/novel-agent/doc/Project_Overview.md)
+- **Architecture**: Explains the roles of Core, Agents, and Pipeline modules.
+- **Tech Stack**: Lists key libraries (Python, OpenCV, Jinja2, Pytest).
+- **Memory Mechanism**: Detailed explanation of the Hierarchical Memory (Context Consolidation) and Dynamic World Building (Piggyback Entity Extraction).
 
-### 文档
-- **`tests/README_TEST.md`**: 详细的中文使用说明。
-- **`tests/test_report.txt`**: 最近一次成功运行的测试报告 (27 个测试用例全部通过)。
+#### [API_Manual.md](file:///i:/WorkSpace/novel-agent/doc/API_Manual.md)
+- **CLI Manual**: Comprehensive guide to command-line arguments (`--step`, `--rollback`, `--auto`, etc.).
+- **Backend API Plan**: A drafted specification for future REST API endpoints (`/api/project/init`, `/api/artifacts/...`), laying the groundwork for a web frontend.
 
-## 2. 如何运行
+## Next Steps
+The project core is now robust with:
+-   **Structure**: Clear separation of concerns.
+-   **Memory**: Long-term context retention.
+-   **Evolution**: Self-updating world bible.
+-   **Usability**: Automated CLI flow.
+-   **Documentation**: Developer and user guides.
 
-所有操作建议在项目根目录下进行。
-
-**运行所有测试:**
-```powershell
-python311 -m pytest tests/test_01_ideation.py tests/test_02_outline.py tests/test_03_bible.py tests/test_04_drafting.py
-```
-
-**刷新测试数据:**
-```powershell
-python311 tests/extract_fixtures.py
-```
-
-## 3. 注意事项
-- 由于 Windows 环境下的编码问题，`test_02_outline.py` 采用了更稳健的检测方式，专注于验证核心结构（分卷、标题）而非特定的中文字符串匹配。
-- 并行测试支持通过 `pytest-xdist` 开启（如果安装了该插件）。
+Ready for extensive testing or frontend integration.

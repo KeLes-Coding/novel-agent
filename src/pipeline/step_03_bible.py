@@ -5,13 +5,14 @@ import re
 from typing import Dict, Any, List
 from jinja2 import Template
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from utils.json_utils import extract_json
 
 
 def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Step 03: 设定集生成 (三层架构)
     Layer 1: Extraction (JSON) -> 提取需设定的名单
-    Layer 2: Expansion (Parallel) -> 并行生成详细档案
+    Layer 2: Expansion (Parallel) -> 并行生成详细档案 (JSON + MD)
     Layer 3: Analysis (Critique) -> 一致性检查
     """
     cfg = step_ctx["cfg"]
@@ -28,8 +29,7 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     with open(outline_path, "r", encoding="utf-8") as f:
         outline_context = f.read()
 
-    # 截取大纲前 2000 字作为 summary 传给并行任务，避免 prompt 过长
-    # 或者如果模型上下文够大，可以传全文
+    # 截取大纲前 3000 字作为 summary
     outline_summary = outline_context[:3000]
 
     render_ctx = {
@@ -55,55 +55,65 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     prompt_p1 = Template(extract_tpl).render(**render_ctx)
 
     json_path = f"{base_dir}/01_entity_list.json"
-    full_json_str = ""
+    
+    entities_data = {}
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            full_json_str = ""
+            if hasattr(provider, "stream_generate"):
+                buffer = []
+                for chunk in provider.stream_generate(
+                    system=system_prompt, prompt=prompt_p1
+                ):
+                    buffer.append(chunk)
+                full_json_str = "".join(buffer)
+            else:
+                full_json_str = provider.generate(
+                    system=system_prompt, prompt=prompt_p1
+                ).text
+            
+            # Parse
+            entities_data = extract_json(full_json_str)
+            if not isinstance(entities_data, dict):
+                raise ValueError("Output is not a dict")
+            
+            # Save raw
+            with open(store._abs(json_path), "w", encoding="utf-8") as f:
+                f.write(full_json_str)
+            break
+            
+        except Exception as e:
+            if log:
+                log.warning(f"Layer 1 JSON Parse Attempt {attempt+1}/{max_retries} Failed: {e}")
+            if attempt == max_retries - 1:
+                raise RuntimeError("Failed to parse Entity List JSON after retries.") from e
 
-    with open(store._abs(json_path), "w", encoding="utf-8") as f:
-        if hasattr(provider, "stream_generate"):
-            for chunk in provider.stream_generate(
-                system=system_prompt, prompt=prompt_p1
-            ):
-                f.write(chunk)
-                f.flush()
-                full_json_str += chunk
-        else:
-            full_json_str = provider.generate(
-                system=system_prompt, prompt=prompt_p1
-            ).text
-            f.write(full_json_str)
-
-    # 解析 JSON
-    raw_json = re.sub(r"^```json", "", full_json_str.strip(), flags=re.MULTILINE)
-    raw_json = re.sub(r"^```", "", raw_json, flags=re.MULTILINE)
-
-    try:
-        entities_data = json.loads(raw_json)
-        # 展平为任务列表
-        # task format: (category, name)
-        tasks = []
-        for category, names in entities_data.items():
-            if isinstance(names, list):
-                for name in names:
-                    tasks.append({"category": category, "name": name})
-
-    except Exception as e:
-        if log:
-            log.error(f"Layer 1 JSON Parse Failed: {e}")
-        raise RuntimeError("Failed to parse Entity List JSON.")
+    # 展平为任务列表
+    # task format: (category, name)
+    tasks = []
+    for category, names in entities_data.items():
+        if isinstance(names, list):
+            for name in names:
+                tasks.append({"category": category, "name": name})
 
     if log:
         log.info(f"Layer 1 complete. Found {len(tasks)} entities to profile.")
 
     # ==========================================
-    # Layer 2: Parallel Expansion (流式写入临时文件)
+    # Layer 2: Parallel Expansion (JSON + Markdown)
     # ==========================================
     if log:
-        log.info("Layer 2: Creating profiles in parallel...")
+        log.info("Layer 2: Creating profiles in parallel (JSON output)...")
 
     expand_tpl = prompts.get("bible", {}).get("expansion", "")
-    profiles_content = [None] * len(tasks)
+    
+    # Store results: index -> { "data": dict, "text": str }
+    expansion_results = [None] * len(tasks)
 
-    def _expand_profile_task(index: int, task: dict) -> str:
-        """单档案扩写"""
+    def _expand_profile_task(index: int, task: dict) -> Dict[str, Any]:
+        """单档案扩写：返回 structured data 和 markdown"""
         p_ctx = {
             "category": task["category"],
             "name": task["name"],
@@ -111,33 +121,66 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         }
         prompt_p2 = Template(expand_tpl).render(**p_ctx)
 
-        # 简化的文件名 (移除非法字符)
-        safe_name = re.sub(r'[\\/*?:"<>|]', "", task["name"])
-        temp_file_path = f"{temp_dir}/{task['category']}_{safe_name}.md"
-        abs_temp_path = store._abs(temp_file_path)
+        # Retry logic for Layer 2
+        profile_data = {}
+        last_error = None
+        
+        for attempt in range(3):
+            try:
+                llm_output = ""
+                if hasattr(provider, "stream_generate"):
+                    chunk_buffer = []
+                    for chunk in provider.stream_generate(
+                        system=system_prompt, prompt=prompt_p2
+                    ):
+                        chunk_buffer.append(chunk)
+                    llm_output = "".join(chunk_buffer)
+                else:
+                    llm_output = provider.generate(system=system_prompt, prompt=prompt_p2).text
+                
+                # Parse
+                profile_data = extract_json(llm_output)
+                if not isinstance(profile_data, dict):
+                     raise ValueError("Output is not a dict")
+                break
+            except Exception as e:
+                last_error = e
+        
+        if not profile_data:
+            # Fallback
+            profile_data = {
+                "name": task["name"],
+                "category": task["category"],
+                "base_info": "Unknown",
+                "traits": "Parse Failed",
+                "backstory": f"Failed to parse JSON. Error: {last_error}",
+                "role": "Unknown",
+                "highlight": "Unknown"
+            }
 
-        header = f"## {p_ctx['category']}档案：{p_ctx['name']}\n\n"
-        full_text_buffer = ""
+        # Generate Markdown from Data
+        name = profile_data.get("name", task["name"])
+        cat = profile_data.get("category", task["category"])
+        
+        md_text = f"## {cat}档案：{name}\n\n"
+        md_text += f"**基础信息**：{profile_data.get('base_info', '')}\n\n"
+        md_text += f"**核心特质**：{profile_data.get('traits', '')}\n\n"
+        md_text += f"**背景故事**：{profile_data.get('backstory', '')}\n\n"
+        md_text += f"**关联角色**：{profile_data.get('role', '')}\n\n"
+        md_text += f"**高光时刻**：{profile_data.get('highlight', '')}\n\n"
 
-        with open(abs_temp_path, "w", encoding="utf-8") as f:
-            f.write(header)
+        # Save Temp Markdown
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", name)
+        temp_file_path = f"{temp_dir}/{cat}_{safe_name}.md"
+        with open(store._abs(temp_file_path), "w", encoding="utf-8") as f:
+            f.write(md_text)
 
-            if hasattr(provider, "stream_generate"):
-                for chunk in provider.stream_generate(
-                    system=system_prompt, prompt=prompt_p2
-                ):
-                    f.write(chunk)
-                    f.flush()
-                    full_text_buffer += chunk
-            else:
-                text = provider.generate(system=system_prompt, prompt=prompt_p2).text
-                f.write(text)
-                full_text_buffer = text
-
-        return header + full_text_buffer
+        return {
+            "data": profile_data,
+            "text": md_text
+        }
 
     # 并行执行
-    # 注意：如果实体太多，可以适当限制 max_workers，比如 5-8
     with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as executor:
         future_map = {
             executor.submit(_expand_profile_task, i, t): i for i, t in enumerate(tasks)
@@ -146,13 +189,13 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
         for future in as_completed(future_map):
             idx = future_map[future]
             try:
-                res_text = future.result()
-                profiles_content[idx] = res_text
+                res = future.result()
+                expansion_results[idx] = res
                 if log:
                     log.info(f"  - Profile for '{tasks[idx]['name']}' created.")
             except Exception as e:
                 error_msg = f"## 档案生成失败: {tasks[idx]['name']}\nError: {e}"
-                profiles_content[idx] = error_msg
+                expansion_results[idx] = {"data": {}, "text": error_msg}
                 if log:
                     log.error(f"  - Profile '{tasks[idx]['name']}' failed: {e}")
 
@@ -162,15 +205,17 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     if log:
         log.info("Layer 3: Checking consistency...")
 
-    # 拼装完整设定集
-    full_bible_text = "\n\n---\n\n".join(filter(None, profiles_content))
+    valid_results = [r for r in expansion_results if r and r.get("data")]
+    
+    # 1. Save Full JSON
+    all_profiles_data = [r["data"] for r in valid_results]
+    bible_json_path = f"{base_dir}/bible.json"
+    store.save_json(bible_json_path, all_profiles_data)
+
+    # 2. Assemble Full Markdown
+    full_bible_text = "\n\n---\n\n".join([r["text"] for r in expansion_results if r])
 
     analysis_tpl = prompts.get("bible", {}).get("analysis", "")
-
-    # 构建 Prompt (注意输入长度，可能很大)
-    # 这里我们只传入 "设定集" 和 "大纲摘要"
-    p_ctx_l3 = {"bible_context": full_bible_text, "outline_context": outline_summary}
-    # 如果 analysis_tpl 不依赖变量渲染，可以直接拼接
     prompt_p3 = f"{analysis_tpl}\n\n【完整设定集】\n{full_bible_text}\n\n【大纲摘要】\n{outline_summary}"
 
     analysis_path = f"{base_dir}/02_analysis.md"
@@ -179,12 +224,16 @@ def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
     with open(store._abs(analysis_path), "w", encoding="utf-8") as f:
         f.write("# 世界观一致性评估报告\n\n")
         if hasattr(provider, "stream_generate"):
-            for chunk in provider.stream_generate(
-                system=system_prompt, prompt=prompt_p3
-            ):
-                f.write(chunk)
-                f.flush()
-                analysis_content += chunk
+             # Simple try/except for safety
+            try:
+                for chunk in provider.stream_generate(
+                    system=system_prompt, prompt=prompt_p3
+                ):
+                    f.write(chunk)
+                    f.flush()
+                    analysis_content += chunk
+            except Exception as e:
+                 f.write(f"\n[Analysis Generation Error: {e}]")
         else:
             analysis_content = provider.generate(
                 system=system_prompt, prompt=prompt_p3

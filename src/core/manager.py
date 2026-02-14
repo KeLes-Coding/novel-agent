@@ -16,7 +16,7 @@ from core.fsm import StateMachine, ProjectPhase
 from pipeline.step_01_ideation import run as run_ideation
 from pipeline.step_02_outline import run as run_outline
 from pipeline.step_03_bible import run as run_bible
-from pipeline.step_04_drafting import draft_single_scene
+from pipeline.step_05_drafting import draft_single_scene
 
 from core.workflow import WorkflowEngine
 from interfaces.base import UserInterface
@@ -294,23 +294,96 @@ class ProjectManager:
         try:
             # 构建 Context
             build_res = self.ctx_builder.build(scene_node.id)
-            scene_node.meta["dynamic_context"] = build_res["payload"]
+            dynamic_ctx = build_res["payload"]
+            
+            # Inject chapter_words for prompt
+            avg_chapter_words = self.config.get("content", {}).get("length", {}).get("avg_chapter_words", 3000)
+            dynamic_ctx["chapter_words"] = avg_chapter_words
+            
+            scene_node.meta["dynamic_context"] = dynamic_ctx
             
             # 执行生成 (WorkflowEngine)
             self.workflow.process_scene(scene_node, self.state.outline_path, self.state.bible_path)
             
             # 后处理 (摘要与保存)
-            with open(scene_node.content_path, "r", encoding="utf-8") as f:
-                final_text = f.read()
-            scene_node.summary = self.wiki_updater.summarize(final_text)
+            final_text = ""
+            if scene_node.content_path.endswith(".json"):
+                with open(scene_node.content_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    final_text = data.get("content", "")
+            else:
+                with open(scene_node.content_path, "r", encoding="utf-8") as f:
+                    final_text = f.read()
+            
+            # Piggyback Extraction: Summary + New Facts
+            analysis = self.wiki_updater.analyze_scene(final_text)
+            
+            scene_node.summary = analysis.get("summary", "Summary failed.")
+            new_facts = analysis.get("new_facts", [])
+            
             self.state.save()
+            
+            # 2.1 触发动态设定更新 (Dynamic Bible Update)
+            if new_facts:
+                self.log.info(f"Scene {scene_node.id} triggered bible update with {len(new_facts)} new facts.")
+                self.wiki_updater.patch_bible(
+                    self.state.bible_path, 
+                    new_facts, 
+                    scene_node.title
+                )
+            
+            # 2.2 触发记忆归档
+            self._consolidate_memory(scene_node.id)
             
         except Exception as e:
             self.log.error(f"场景 {scene_node.id} 处理失败: {e}")
             raise e
 
-        # 3. 处理分支
-        self._handle_branches(scene_node, auto_mode)
+    def _consolidate_memory(self, current_scene_id: int):
+        """
+        Check if we need to consolidate old scene summaries into archive.
+        Buffer: Keep last 5 scenes active. Archive scenes before that in batches of 5.
+        """
+        # Buffer size = 5. We need at least 10 scenes since last archive to trigger a new archive of 5.
+        # Actually, let's keep it simple:
+        # If (current_scene_id - last_archived) >= 10:
+        #    Archive range: [last_archived + 1, last_archived + 5]
+        #    New last_archived = last_archived + 5
+        
+        last_archived = self.state.last_archived_scene_id
+        if (current_scene_id - last_archived) >= 10:
+            start_id = last_archived + 1
+            end_id = last_archived + 5
+            
+            self.log.info(f"Consolidating memory for scenes {start_id} to {end_id} ...")
+            
+            # Find these scenes
+            # Note: self.state.scenes is a list, but IDs might not be continuous indices if we have branches.
+            # However, for linear history (archived memory), we usually track the 'main timeline'.
+            # Simplification: We only archive linear segments. 
+            # Or we just find scenes by ID if IDs are globally unique and sequential-ish.
+            
+            scenes_to_archive = []
+            for sid in range(start_id, end_id + 1):
+                # Find scene with this ID
+                # FIXME: This linear search is slow for large N, but N is small for now.
+                # Also, we need to handle if scene ID doesn't exist (e.g. skipped numbers?)
+                # Assumes scenes have sequential IDs for now.
+                node = next((s for s in self.state.scenes if s.id == sid), None)
+                if node and node.summary:
+                    scenes_to_archive.append(node.summary)
+                else:
+                    self.log.warning(f"Scene {sid} not found or missing summary during consolidation.")
+            
+            if scenes_to_archive:
+                chapter_summary = self.wiki_updater.consolidate_summaries(scenes_to_archive)
+                self.state.archived_summaries.append(chapter_summary)
+                self.state.last_archived_scene_id = end_id
+                self.state.save()
+                self.log.info(f"Memory consolidated. New archive count: {len(self.state.archived_summaries)}")
+
+                self.state.save()
+                self.log.info(f"Memory consolidated. New archive count: {len(self.state.archived_summaries)}")
 
     def _handle_branches(self, scene_node: SceneNode, auto_mode: bool):
         """处理子分支选择与递归"""

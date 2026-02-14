@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Callable, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.state import SceneNode, SceneCandidate, ArtifactCandidate
-from pipeline.step_04_drafting import draft_single_scene
+from pipeline.step_05_drafting import draft_single_scene
 from interfaces.base import UserInterface
 
 class WorkflowEngine:
@@ -344,7 +344,8 @@ class WorkflowEngine:
 
     def _generate_single(self, scene_node: SceneNode, outline_path: str, bible_path: str):
          self.log.info(f"正在生成单线草稿: 场景 {scene_node.id}")
-         rel_path = f"04_drafting/scenes/scene_{scene_node.id:03d}.md"
+         # Output path is now .json
+         rel_path = f"05_drafting/scenes/scene_{scene_node.id:03d}.json"
          draft_single_scene(
              scene_data=scene_node.meta,
              cfg=self.ctx["cfg"],
@@ -368,7 +369,8 @@ class WorkflowEngine:
         with ThreadPoolExecutor(max_workers=self.num_candidates) as executor:
             for i in range(self.num_candidates):
                 cid = f"v{i+1}"
-                rel_path = f"04_drafting/scenes/scene_{scene_node.id:03d}_{cid}.md"
+                # Output path is now .json
+                rel_path = f"05_drafting/scenes/scene_{scene_node.id:03d}_{cid}.json"
                 future = executor.submit(
                      draft_single_scene,
                      scene_data=scene_node.meta,
@@ -388,6 +390,7 @@ class WorkflowEngine:
         for f in as_completed(futures):
             cid, rpath = futures[f]
             try:
+                # result is text content
                 text = f.result()
                 candidates.append(SceneCandidate(id=cid, content_path=self.ctx["store"]._abs(rpath), meta={"char_len": len(text)}))
             except Exception as e:
@@ -406,10 +409,21 @@ class WorkflowEngine:
         selected.selected = True
         scene_node.selected_candidate_id = winner_id
         
-        # 保存标准路径
-        standard_path = f"04_drafting/scenes/scene_{scene_node.id:03d}.md"
+        # 保存标准路径 (Copy JSON content)
+        standard_path = f"05_drafting/scenes/scene_{scene_node.id:03d}.json"
+        
+        # Read the selected JSON content
+        import json
         with open(selected.content_path, "r", encoding="utf-8") as src:
-             self.ctx["store"].save_text(standard_path, src.read())
+             data = json.load(src)
+        
+        # Save to standard path
+        self.ctx["store"].save_json(standard_path, data)
+        
+        # Also save sidecar MD for standard
+        std_md_path = standard_path.replace(".json", ".md")
+        self.ctx["store"].save_text(std_md_path, data.get("content", ""))
+
         scene_node.content_path = self.ctx["store"]._abs(standard_path)
         scene_node.status = "done"
 
