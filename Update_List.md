@@ -75,20 +75,21 @@
 
 ### Phase 4: 风格去噪与润色 (Humanization & Polishing)
 
-**目标**：**去除 AI 味**，引入多角色协作提升文学性。
+**目标**：**去除 AI 味**，引入多角色协作提升文学性，**实现风格迁移**。
 
-#### 4.1 Prompt 工程升级 (`config/prompts_v2.yaml`) **(New)**
-* [ ] **Show, Don't Tell**：重写 Prompt，强制要求侧面描写而非直接陈述。
-* [ ] **Few-Shot Learning**：在 Prompt 中动态插入高质量网文片段作为 `Example`（风格迁移）。
+#### 4.1 基础设施：语料与风格库 (Data & Logic)
+* [ ] **语料清洗工具 (`src/tools/ingest/`)**：实现 `normalize.py`（清洗）和 `splitter.py`（切片）。
+* [ ] **风格向量库 (Style Bank)**：搭建向量检索系统（RAG），支持按场景类型检索风格切片。
+* [ ] **风格路由 (Style Router)**：在 `SceneNode` 中配置风格偏好（Author/Mix）。
 
-#### 4.2 阅读者 Agent (`src/agents/reader.py`) **(New)**
-* [ ] **角色定位**：模拟挑剔的读者。
-* [ ] **任务**：阅读 Draft，提出具体的批评（如：“对话太僵硬”、“打斗缺乏画面感”、“爽点铺垫不足”）。不修改正文，只输出 `Critique Report`。
+#### 4.2 动态上下文增强 (Context Injection)
+* [ ] **ContextBuilder 升级**：将检索到的 `style_examples` 动态注入到 Drafting Prompt 中。
+* [ ] **Prompt 工程升级 (`config/prompts_v2.yaml`)**：引入 Few-Shot Learning 和 "Show, Don't Tell" 约束。
 
-#### 4.3 润色 Agent (`src/agents/polisher.py`) **(New)**
-* [ ] **角色定位**：资深网文编辑。
-* [ ] **任务**：输入 `Draft` + `Critique Report`，输出 `Final Polish`。
-* [ ] **关注点**：去除翻译腔，强化情绪渲染，优化短句节奏。
+#### 4.3 多角色协作管道 (Agent Pipeline)
+* [ ] **阅读者 Agent (`src/agents/reader.py`)**：模拟挑剔读者，输出 Critique Report（不改文）。
+* [ ] **润色 Agent (`src/agents/polisher.py`)**：资深编辑，根据 Critique 和风格画像进行精修。
+* [ ] **工作流集成**：在 `WorkflowEngine` 中实现 `Draft -> Review -> Polish` 的自动/半自动循环。
 
 ---
 
@@ -131,6 +132,12 @@ novel-agent/
 │   │   ├── reader.py    # (New) 审稿/吐槽
 │   │   ├── polisher.py  # (New) 润色/精修
 │   │   ├── wiki.py      # 设定更新
+│   ├── style/           # (New) 风格迁移与 RAG
+│   │   ├── indexer.py   # 向量库写入
+│   │   ├── retriever.py # 风格检索
+│   │   └── router.py    # 风格路由
+│   ├── tools/           # (New) 离线工具
+│   │   └── ingest/      # 语料清洗与切片
 │   ├── providers/       # LLM 接口
 │   └── utils/           # 工具类 (Logger, Hasher)
 ├── main.py              # CLI 入口

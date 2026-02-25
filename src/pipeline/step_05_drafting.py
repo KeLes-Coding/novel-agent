@@ -75,48 +75,69 @@ def draft_single_scene(
     if log:
         log.info(f"Drafting scene to {rel_path} ...")
 
-    # 4. 执行生成 (流式收集)
+    # 4. 准备输出 (Sidecar MD stream + Console)
+    md_path = abs_path.replace(".json", ".md")
+    
+    # 5. 执行生成 (流式收集)
     full_text = ""
     start_time = time.time()
-
+    
     try:
         if hasattr(provider, "stream_generate"):
-            buffer = []
-            for chunk in provider.stream_generate(
-                system=system_prompt,
-                prompt=user_prompt,
-                meta={"scene_id": render_ctx.get("scene_id")},
-            ):
-                buffer.append(chunk)
-            full_text = "".join(buffer)
+            with open(md_path, "w", encoding="utf-8") as md_file:
+                # Write Header
+                header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
+                md_file.write(header)
+                md_file.flush()
+                
+                # Only print start message once
+                if log:
+                    log.info(f"Start streaming to {md_path}...")
+                
+                buffer = []
+                for chunk in provider.stream_generate(
+                    system=system_prompt,
+                    prompt=user_prompt,
+                    meta={"scene_id": render_ctx.get("scene_id")},
+                ):
+                    # 1. Console Stream - REMOVED to avoid mess
+                    # print(chunk, end="", flush=True)
+                    
+                    # 2. File Stream
+                    md_file.write(chunk)
+                    md_file.flush()
+                    
+                    buffer.append(chunk)
+                
+                print("\n") # Newline after stream
+                full_text = "".join(buffer)
         else:
             full_text = provider.generate(system=system_prompt, prompt=user_prompt).text
+            # Write MD for non-stream provider
+            with open(md_path, "w", encoding="utf-8") as md_file:
+                header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
+                md_file.write(header + full_text)
+
     except Exception as e:
         if log:
             log.error(f"Generation failed for {rel_path}: {e}")
         raise e
 
-    # 5. 保存 JSON 和 Sidecar Markdown
+    # 6. 保存 JSON
     
     # 构造数据对象
     draft_data = {
         "scene_id": render_ctx.get("scene_id"),
+        "timestamp": start_time,
+        "run_id": run_id,
         "title": render_ctx.get("scene_title"),
         "content": full_text,
         "meta": scene_data, # 包含 summary 等
-        "timestamp": start_time,
-        "run_id": run_id
     }
     
     # 保存 JSON
     with open(abs_path, "w", encoding="utf-8") as f:
         json.dump(draft_data, f, indent=2, ensure_ascii=False)
-        
-    # 保存 Sidecar MD (用于查看)
-    md_path = abs_path.replace(".json", ".md")
-    with open(md_path, "w", encoding="utf-8") as f:
-        header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
-        f.write(header + full_text)
 
     # 6. 返回纯文本 (WorkflowEngine 需要长度)
     return full_text

@@ -93,6 +93,37 @@ class ContextBuilder:
             del safe_meta["dynamic_context"]
 
         # 4. 组装 Payload
+
+
+        # 4. === Style RAG Integration ===
+        style_examples = []
+        try:
+            # Lazy load retriever to avoid circular imports or init overhead if not needed
+            from style.retriever import StyleRetriever
+            # We assume DB path is standard. In production, pass via config.
+            # Singleton or cached instance would be better, but for now init here is safe (files based).
+            retriever = StyleRetriever()
+            
+            # Construct Query
+            # Priority: Scene Summary > Scene Title
+            query = scene_node.summary if scene_node.summary else scene_node.title
+            
+            # Filter Logic
+            filters = {}
+            # Check meta for style config
+            if "style_author" in scene_node.meta:
+                filters["author"] = scene_node.meta["style_author"]
+            
+            # Retrieve
+            if query:
+                results = retriever.retrieve(query, n_results=3, filter_meta=filters)
+                for r in results:
+                    style_examples.append(r["text"])
+                    
+        except Exception as e:
+            print(f"[ContextBuilder] Style retrieval failed: {e}")
+
+        # 5. 组装 Payload
         payload = {
             # 全局背景
             "idea": idea_text,
@@ -100,13 +131,15 @@ class ContextBuilder:
             "bible": bible_text,
             # 动态上下文
             "prev_context": prev_context,
+            # 风格示例
+            "style_examples": style_examples, 
             # 当前任务信息
             "scene_id": scene_node.id,
             "scene_title": scene_node.title,
             "scene_meta": safe_meta,  # 使用安全的副本
         }
 
-        # 5. 返回构建结果与调试信息
+        # 6. 返回构建结果与调试信息
         return {
             "payload": payload,
             "debug_info": {
@@ -115,6 +148,7 @@ class ContextBuilder:
                 "outline_len": len(outline_text),
                 "bible_len": len(bible_text),
                 "prev_context_preview": prev_context[:50],
+                "style_examples_count": len(style_examples),
             },
         }
 

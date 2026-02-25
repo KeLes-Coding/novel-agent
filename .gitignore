@@ -180,3 +180,6 @@ config/.env
 
 novel-agent/
 config/config.yaml
+
+doc/
+data/

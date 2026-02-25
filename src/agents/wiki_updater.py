@@ -1,6 +1,7 @@
 # src/agents/wiki_updater.py
 from typing import Any, Dict
 from providers.base import LLMProvider
+import os
 
 
 class WikiUpdater:
@@ -67,7 +68,6 @@ class WikiUpdater:
         if not new_facts:
             return
 
-        import os
         if not os.path.exists(bible_path):
              # Creates if not exists (though typically it should exist)
              with open(bible_path, "w", encoding="utf-8") as f:

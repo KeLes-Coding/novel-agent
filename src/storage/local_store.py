@@ -29,6 +29,11 @@ class LocalStore:
             json.dump(obj, f, ensure_ascii=False, indent=2)
         return path
 
+    def load_json(self, rel_path: str) -> Dict[str, Any]:
+        path = self._abs(rel_path)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     def open_text(self, rel_path: str, mode: str = "w") -> Tuple[str, TextIO]:
         """
         用于流式写文件：返回 (abs_path, file_handle)

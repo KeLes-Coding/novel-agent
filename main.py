@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--run-id", help="恢复已有的运行 ID")
     parser.add_argument(
         "--step",
-        choices=["ideation", "outline", "bible", "plan", "draft"],
+        choices=["ideation", "outline", "bible", "plan", "draft", "review", "export"],
         help="执行特定步骤 (这将强制跳转状态)",
     )
     parser.add_argument(
@@ -47,6 +47,10 @@ def main():
 
     cli.notify("项目状态", f"项目 ID: {manager.run_id}\n当前阶段: {manager.fsm.current_phase.value}", {"存储目录": manager.run_dir})
 
+    
+    # 0. 导入 ProjectPhase (放在这里或文件头部)
+    from core.fsm import ProjectPhase
+
     if args.rollback:
         # 映射别名到 Enum 值
         mapping = {
@@ -61,15 +65,52 @@ def main():
         else:
             cli.notify("取消", "回退操作已取消。")
 
-    elif args.auto:
+    elif args.step:
+        # 如果指定了 --step，优先处理状态切换
+        step_mapping = {
+            "ideation": ProjectPhase.IDEATION,
+            "outline": ProjectPhase.OUTLINE,
+            "bible": ProjectPhase.BIBLE,
+            "plan": ProjectPhase.SCENE_PLAN,
+            "draft": ProjectPhase.DRAFTING,
+            "review": ProjectPhase.REVIEW,
+            "export": ProjectPhase.EXPORT
+        }
+        target_phase = step_mapping.get(args.step)
+        
+        # 仅当处于 auto 模式时，才强制切换状态以设定起点
+        # 如果是单步执行(非 auto)，原来的逻辑(调用 manager.run_xxx)会处理流转
+        if args.auto and target_phase:
+             manager.fsm.transition_to(target_phase, force=True)
+
+        if args.auto:
+             # 如果是 Step + Auto，切换完状态后进入 Auto 逻辑
+             pass 
+        else:
+            # 单步执行逻辑
+            if args.step == "ideation":
+                manager.run_ideation()
+            elif args.step == "outline":
+                manager.run_outline()
+            elif args.step == "bible":
+                manager.run_bible()
+            elif args.step == "plan":
+                manager.init_scenes()
+            elif args.step == "draft":
+                manager.run_drafting_loop(auto_mode=args.auto)
+            elif args.step == "review":
+                manager.run_review()
+            elif args.step == "export":
+                manager.run_export()
+            # 执行完单步退出
+            return
+
+    if args.auto:
         cli.notify("模式", "启动自动推进模式 (按 Ctrl+C 终止)...")
         try:
             # 循环直到项目完成
             while manager.state.step != "done":
                 manager.execute_next_step()
-                
-                # 可选：如果需要在步骤间暂停，可以在此添加 logic
-                # currently execute_next_step handles HITL internally, so we just loop.
                 
             cli.notify("结束", "自动模式执行完毕。")
             
@@ -80,20 +121,8 @@ def main():
             traceback.print_exc()
             cli.notify("执行中断", str(e))
 
-    elif args.step:
-        if args.step == "ideation":
-            manager.run_ideation()
-        elif args.step == "outline":
-            manager.run_outline()
-        elif args.step == "bible":
-            manager.run_bible()
-        elif args.step == "plan":
-            manager.init_scenes()
-        elif args.step == "draft":
-            manager.run_drafting_loop(auto_mode=args.auto)
-
     else:
-        if not args.rollback:
+        if not args.rollback and not args.step:
             print("请指定 --step <步骤名> 或 --auto 或 --rollback")
 
 if __name__ == "__main__":

@@ -346,7 +346,9 @@ class WorkflowEngine:
          self.log.info(f"正在生成单线草稿: 场景 {scene_node.id}")
          # Output path is now .json
          rel_path = f"05_drafting/scenes/scene_{scene_node.id:03d}.json"
-         draft_single_scene(
+         
+         # 1. Initial Draft
+         text_result = draft_single_scene(
              scene_data=scene_node.meta,
              cfg=self.ctx["cfg"],
              prompts=self.ctx["prompts"],
@@ -359,8 +361,161 @@ class WorkflowEngine:
              jsonl=self.ctx["jsonl"],
              run_id=self.ctx["run_id"]
          )
+         
+         # 2. Auto-Polish is now handled in Review Phase (per user request)
+         # But if we want to keep it optional in drafting, we could. 
+         # User said: "Should be implemented in Review phase".
+         # So we remove it from here to avoid double work, or make it configurable.
+         # For now, we strictly follow the request to move it to Review.
+         
          scene_node.content_path = self.ctx["store"]._abs(rel_path)
          scene_node.status = "done"
+
+    def run_polish_cycle(self, scene_node: SceneNode) -> bool:
+        """
+        Run the Writer -> Reader -> Polisher loop for a single scene.
+        Returns True if polished, False otherwise.
+        """
+        if not self.cfg.get("workflow", {}).get("auto_polish", False):
+            return False
+
+        self.log.info(f"Review Phase: Starting Auto-Polish for Scene {scene_node.id}: {scene_node.title}")
+        
+        # 1. Load Current Content
+        if not scene_node.content_path or not os.path.exists(scene_node.content_path):
+            self.log.warning(f"Scene {scene_node.id} content missing at {scene_node.content_path}. Trying fallback to drafting.")
+            fallback_path = self.store._abs(f"05_drafting/scenes/scene_{scene_node.id:03d}.json")
+            if os.path.exists(fallback_path):
+                self.log.info(f"Fallback found at {fallback_path}. Restoring content_path.")
+                scene_node.content_path = fallback_path
+            else:
+                self.log.error(f"Fallback also missing for Scene {scene_node.id}. Cannot polish.")
+                return False
+            
+        import json
+        current_text = ""
+        current_data = {}
+        
+        try:
+            if scene_node.content_path.endswith(".json"):
+                with open(scene_node.content_path, "r", encoding="utf-8") as f:
+                    current_data = json.load(f)
+                    current_text = current_data.get("content", "")
+            else:
+                with open(scene_node.content_path, "r", encoding="utf-8") as f:
+                    current_text = f.read()
+                    current_data = {"content": current_text}
+        except Exception as e:
+            self.log.error(f"Failed to load scene {scene_node.id}: {e}")
+            return False
+
+        if not current_text:
+            self.log.warning(f"Scene {scene_node.id} is empty. Skipping polish.")
+            return False
+
+        # 2. Reader - Critique
+        from agents.reader import ReaderAgent
+        reader = ReaderAgent(self.provider)
+        self.log.info(f"Scene {scene_node.id}: Reader analyzing...")
+        critique = reader.critique(current_text)
+        score = critique.get("score", 0)
+        self.log.info(f"Scene {scene_node.id} - Reader Score: {score}")
+
+        # 3. Polisher - Refine
+        from agents.polisher import PolisherAgent
+        polisher = PolisherAgent(self.provider)
+        style_guide = scene_node.meta.get("style_guide", "")
+        if not style_guide:
+            tone = self.cfg.get("story_constraints", {}).get("tone", [])
+            pov = self.cfg.get("story_constraints", {}).get("pov", "第三人称")
+            style_guide = f"视角：{pov}\n基调：{', '.join(tone) if isinstance(tone, list) else tone}"
+        
+        # --- Style RAG Integration for Polishing ---
+        style_examples = []
+        try:
+            from style.retriever import StyleRetriever
+            retriever = StyleRetriever()
+            
+            # Construct Query
+            query = scene_node.summary if scene_node.summary else scene_node.title
+            
+            # Filter Logic
+            filters = {}
+            if "style_author" in scene_node.meta:
+                filters["author"] = scene_node.meta["style_author"]
+            
+            # Retrieve
+            if query:
+                results = retriever.retrieve(query, n_results=3, filter_meta=filters)
+                for r in results:
+                    style_examples.append(r["text"])
+        except Exception as e:
+            self.log.error(f"Review phase style retrieval failed: {e}")
+        # ---------------------------------------------
+        
+        # Define output paths for streaming
+        polished_rel_path = f"06_polishing/scenes/scene_{scene_node.id:03d}.json"
+        polished_md_path = polished_rel_path.replace(".json", ".md")
+        bypass_md_path = polished_md_path.replace(".md", "_bypass.md")
+        
+        # Ensure directories exist
+        os.makedirs(self.store._abs("06_polishing/scenes"), exist_ok=True)
+        os.makedirs(self.store._abs("06_polishing/diffs"), exist_ok=True)
+        os.makedirs(self.store._abs("06_polishing/critiques"), exist_ok=True)
+        
+        self.log.info(f"Scene {scene_node.id}: Polisher refining with style_guide...\n{style_guide}")
+        polished_text = polisher.polish(current_text, critique, style_guide=style_guide, style_examples=style_examples, output_path=self.store._abs(polished_md_path))
+        
+        # 3.5. AI Bypass (Step 6.5) - Humanize
+        from agents.ai_bypass import AIBypassAgent
+        bypass_agent = AIBypassAgent(self.provider, self.prompts)
+        self.log.info(f"Scene {scene_node.id}: AIBypass applying humanization...")
+        final_text = bypass_agent.bypass(polished_text, output_path=self.store._abs(bypass_md_path))
+
+        # 4. Save Result (Separate Directory: 06_polishing)
+        critique_rel_path = f"06_polishing/critiques/scene_{scene_node.id:03d}_critique.json"
+        diff_rel_path = f"06_polishing/diffs/scene_{scene_node.id:03d}_diff.md"
+        
+        # Generate Diff (Compare original draft with final bypassed text)
+        import difflib
+        diff_lines = list(difflib.unified_diff(
+            current_text.splitlines(keepends=True),
+            final_text.splitlines(keepends=True),
+            fromfile='draft',
+            tofile='polished_and_bypassed',
+            n=3
+        ))
+        diff_text = "".join(diff_lines)
+        if diff_text:
+            self.log.info(f"Saving diff to {diff_rel_path}...")
+            self.store.save_text(diff_rel_path, f"```diff\n{diff_text}\n```")
+        
+        # Save Critique Log
+        critique_data = {
+            "scene_id": scene_node.id,
+            "timestamp": int(time.time()),
+            "score": score,
+            "critique": critique
+        }
+        self.log.info(f"Saving critique to {critique_rel_path}...")
+        self.store.save_json(critique_rel_path, critique_data)
+
+        # Update Draft Data with Polished Text
+        current_data["content"] = final_text
+        current_data["polish_timestamp"] = int(time.time())
+        current_data["critique_ref"] = critique_rel_path
+        
+        self.log.info(f"Saving polished version to {polished_rel_path}...")
+        self.store.save_json(polished_rel_path, current_data)
+        
+        # Also sync sidecar MD for easy reading
+        self.store.save_text(polished_rel_path.replace(".json", ".md"), final_text)
+        
+        # Update scene node to point to the new polished version
+        scene_node.content_path = self.ctx["store"]._abs(polished_rel_path)
+        # We don't change status, it stays 'done'. 
+        
+        return True
 
     def _generate_ab_test(self, scene_node: SceneNode, outline_path: str, bible_path: str):
         self.log.info(f"正在进行 A/B 测试 (生成 {self.num_candidates} 个版本): 场景 {scene_node.id}")

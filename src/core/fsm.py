@@ -1,5 +1,6 @@
 # src/core/fsm.py
 from enum import Enum, auto
+print(f"Loading core.fsm from {__file__}")
 from typing import List, Optional, Dict, Any
 import logging
 
@@ -13,6 +14,7 @@ class ProjectPhase(Enum):
     SCENE_PLAN = "scene_plan"
     DRAFTING = "drafting"
     REVIEW = "review"
+    EXPORT = "export"
     DONE = "done"
 
 class StateMachine:
@@ -29,7 +31,8 @@ class StateMachine:
         ProjectPhase.BIBLE: [ProjectPhase.SCENE_PLAN, ProjectPhase.OUTLINE], # 允许回退到大纲
         ProjectPhase.SCENE_PLAN: [ProjectPhase.DRAFTING, ProjectPhase.BIBLE, ProjectPhase.OUTLINE], # 允许回退
         ProjectPhase.DRAFTING: [ProjectPhase.REVIEW, ProjectPhase.SCENE_PLAN],
-        ProjectPhase.REVIEW: [ProjectPhase.DONE, ProjectPhase.DRAFTING],
+        ProjectPhase.REVIEW: [ProjectPhase.EXPORT, ProjectPhase.DRAFTING],
+        ProjectPhase.EXPORT: [ProjectPhase.DONE, ProjectPhase.REVIEW],
         ProjectPhase.DONE: []
     }
 
@@ -82,7 +85,10 @@ class StateMachine:
             return ["resume_drafting", "review_progress", "back_to_scene_plan"]
         
         elif current == ProjectPhase.REVIEW:
-            return ["finalize_project", "back_to_drafting"]
+            return ["run_export", "back_to_drafting"]
+            
+        elif current == ProjectPhase.EXPORT:
+            return ["finalize_project", "back_to_review"]
             
         elif current == ProjectPhase.DONE:
             return ["view_result", "export", "back_to_review"]
