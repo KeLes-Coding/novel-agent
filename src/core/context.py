@@ -11,9 +11,10 @@ class ContextBuilder:
     并将其组装成 LLM 可理解的 Prompt Payload。
     """
 
-    def __init__(self, state: ProjectState, store):
+    def __init__(self, state: ProjectState, store, cfg: Dict[str, Any] = None):
         self.state = state
         self.store = store
+        self.cfg = cfg or {}
 
     def _find_node_recursive(self, nodes: List[SceneNode], target_id: int) -> Optional[SceneNode]:
         for node in nodes:
@@ -123,6 +124,10 @@ class ContextBuilder:
         except Exception as e:
             print(f"[ContextBuilder] Style retrieval failed: {e}")
 
+        # 提取全局约束
+        constraints = self.cfg.get("story_constraints", {})
+        content_cfg = self.cfg.get("content", {})
+
         # 5. 组装 Payload
         payload = {
             # 全局背景
@@ -137,6 +142,15 @@ class ContextBuilder:
             "scene_id": scene_node.id,
             "scene_title": scene_node.title,
             "scene_meta": safe_meta,  # 使用安全的副本
+            # Story Context (Genre & Tags)
+            "genre": content_cfg.get("genre", ""),
+            "tags": content_cfg.get("tags", []),
+            # Story Constraints (For Global System Prompt)
+            "pov": constraints.get("pov", "第三人称"),
+            "auto_tone": constraints.get("auto_tone", False),
+            "tone": constraints.get("tone", []),
+            "romance_rule": constraints.get("romance_rule", ""),
+            "forbidden": constraints.get("forbidden", []),
         }
 
         # 6. 返回构建结果与调试信息

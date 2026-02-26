@@ -183,3 +183,4 @@ config/config.yaml
 
 doc/
 data/
+chat_prompts.txt

@@ -6,7 +6,6 @@ from typing import List, Dict, Any, Callable, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.state import SceneNode, SceneCandidate, ArtifactCandidate
-from pipeline.step_05_drafting import draft_single_scene
 from interfaces.base import UserInterface
 
 class WorkflowEngine:
@@ -24,8 +23,14 @@ class WorkflowEngine:
         wf_cfg = self.cfg.get("workflow", {})
         self.branching_enabled = wf_cfg.get("branching", {}).get("enabled", False)
         self.num_candidates = wf_cfg.get("branching", {}).get("num_candidates", 2)
-        self.selection_mode = wf_cfg.get("branching", {}).get("selection_mode", "auto")
         self.interactive = wf_cfg.get("interactive", True)
+        selection_mode = wf_cfg.get("branching", {}).get("selection_mode")
+        # Default behavior:
+        # - interactive runs default to manual selection
+        # - non-interactive runs default to auto selection (avoid blocking)
+        if not selection_mode:
+            selection_mode = "manual" if self.interactive else "auto"
+        self.selection_mode = selection_mode
 
     def run_step_with_hitl(
         self,
@@ -35,305 +40,132 @@ class WorkflowEngine:
         selected_path_field: str,
     ) -> ArtifactCandidate:
         """
-        使用 UserInterface 的通用 HITL (Human-In-The-Loop) 步骤执行器。
+        Headless (Non-interactive) step runner.
         """
-        # 1. 检查是否需要生成
         current_candidates = getattr(self.state, candidates_field, [])
 
         if not current_candidates:
-            # 交互式询问生成方式
-            source_choice = 0
-            if self.interactive and self.interface:
-                source_choice = self.interface.ask_choice(
-                    f"[{step_name}] 准备生成内容，请选择来源:",
-                    ["AI 自动生成 (AI Generation)", "上传本地文件 (Upload File)", "直接输入文本 (Direct Input)"],
-                    ["调用大模型生成", "读取本地已有文件作为草稿", "在终端直接输入/粘贴文本"]
-                )
-            
-            # 分支处理
-            if source_choice == 1: # Upload
-                path = self.interface.prompt_input("请输入文件的绝对路径")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    user_cand = ArtifactCandidate(id="用户上传", content=content, selected=True)
-                    # 直接返回，不再进入循环，或者也进入循环让用户确认？
-                    # 这里选择进入循环以便用户可以继续修改或重写
-                    current_candidates = [user_cand]
-                    setattr(self.state, candidates_field, current_candidates)
-                    self.state.save()
-                else:
-                    self.interface.notify("错误", f"找不到文件: {path}")
-                    # 失败回退到 AI 生成
-                    source_choice = 0
-            
-            elif source_choice == 2: # Direct Input
-                content = self.interface.prompt_multiline("请输入内容")
-                if content:
-                    user_cand = ArtifactCandidate(id="用户输入", content=content, selected=True)
-                    current_candidates = [user_cand]
-                    setattr(self.state, candidates_field, current_candidates)
-                    self.state.save()
-                else:
-                    self.interface.notify("提示", "输入为空，转为 AI 生成")
-                    source_choice = 0
+            self.log.info(f"[{step_name}] 正在调用 AI 生成候选项...")
+            try:
+                new_candidates = generate_fn()
+                setattr(self.state, candidates_field, new_candidates)
+                self.state.save()
+            except Exception as e:
+                self.log.error(f"生成失败: {e}")
+                raise e
 
-            # 如果也是 Source Choice == 0 或者上面的失败回退
-            if not current_candidates:
-                self.log.info(f"[{step_name}] 正在调用 AI 生成候选项...")
-                try:
+        # 获取生成的或已存在的候选项
+        candidates = getattr(self.state, candidates_field, [])
+        if not candidates:
+             raise ValueError(f"No candidates generated for step {step_name}")
+
+        if not self.interactive:
+            self.log.info(f"[{step_name}] 自动选择第一个候选项。")
+            selected_candidate = candidates[0]
+            selected_candidate.selected = True
+        else:
+            while True:
+                self.log.info(f"\n[{step_name}] 等待用户从 {len(candidates)} 个候选项中选择...")
+                for i, c in enumerate(candidates):
+                    # 截取前 150 个字符
+                    preview = c.content[:150].replace('\n', ' ') + "..."
+                    print(f"  {i+1}. 选项 {i+1} (ID: {c.id}): {preview}")
+                
+                print("\n操作指引:")
+                print("  [1-N] 直接选择对应编号的候选项")
+                print("  [vN]  查看候选项 N 的完整全文 (例: v1)")
+                print("  [eN]  选择候选项 N 并提供修改意见 (例: e1)")
+                print("  [r]   全部重新生成 (Reroll)")
+                
+                user_in = self.interface.prompt_input("请选择操作", default="1").lower()
+                
+                if user_in == 'r':
+                    self.log.info("用户请求全部重新生成...")
+                    # Clear current candidates and regenerate
+                    setattr(self.state, candidates_field, [])
                     new_candidates = generate_fn()
                     setattr(self.state, candidates_field, new_candidates)
                     self.state.save()
-                except Exception as e:
-                    self.log.error(f"生成失败: {e}")
-                    raise e
-
-        selected_candidate = None
-
-        while True:
-            candidates = getattr(self.state, candidates_field, [])
-
-            # 非交互模式
-            if not self.interactive:
-                self.log.info(f"[{step_name}] 非交互模式，默认自动选择第一个。")
-                selected_candidate = candidates[0]
-                break
-            
-            # 通知用户
-            if self.interface:
-                self.interface.notify(
-                    title=f"人工介入请求: {step_name}",
-                    message=f"已生成 {len(candidates)} 个版本，请审核并选择。",
-                    payload={"当前步骤": step_name}
-                )
-
-            self.state.system_status = "paused_for_input"
-            self.state.save()
-
-            if not self.interface:
-                # 理论上不应该发生
-                self.log.warning("未提供界面接口 (Interface)，自动选择第一个。")
-                selected_candidate = candidates[0]
-                break
-
-            # 选项菜单
-            options_display = []
-            for c in candidates:
-                preview = c.content[:100].replace("\n", " ") + "..."
-                options_display.append(f"[{c.id}] {preview}")
-            
-            # 扩展指令
-            menu_options = [
-                "选择一个版本",
-                "重写 (Reroll) - 放弃当前所有结果",
-                "精修 (Edit/Refine) - 微调选定版本",
-                "上传本地文件 (Upload)"
-            ]
-
-            choice_idx = self.interface.ask_choice(
-                f"当前步骤: {step_name}\n候选项列表:\n" + "\n".join([f"  - {o}" for o in options_display]),
-                menu_options,
-                ["确认最终使用版本", "重新生成所有内容", "对特定版本进行基于 AI 的修改", "使用本地已有的文件"]
-            )
-
-            # 逻辑映射
-            if choice_idx == 0: # 选择
-                cand_idx = self.interface.ask_choice("请选择最终版本:", options_display)
-                selected_candidate = candidates[cand_idx]
-                break
-            
-            elif choice_idx == 1: # 重写
-                if self.interface.confirm("确定要丢弃当前所有结果并重写吗? 这里的操作不可逆。"):
-                    self.log.info("用户请求重写。")
-                    setattr(self.state, candidates_field, [])
-                    self.state.save()
-                    return self.run_step_with_hitl(step_name, generate_fn, candidates_field, selected_path_field)
-
-            elif choice_idx == 2: # 精修
-                cand_idx = self.interface.ask_choice("请选择要精修的基础版本:", options_display)
-                target_cand = candidates[cand_idx]
+                    candidates = new_candidates
+                    continue
+                    
+                if user_in.startswith('v'):
+                    try:
+                        idx = int(user_in[1:]) - 1
+                        if 0 <= idx < len(candidates):
+                            print(f"\n--- 选项 {idx+1} 完整内容 ---\n")
+                            print(candidates[idx].content)
+                            print("\n---------------------------\n")
+                            self.interface.prompt_input("按回车键继续...")
+                        else:
+                            print("无效的编号。")
+                    except ValueError:
+                        print("格式错误，请使用 v1, v2 等。")
+                    continue
+                    
+                if user_in.startswith('e'):
+                    try:
+                        idx = int(user_in[1:]) - 1
+                        if 0 <= idx < len(candidates):
+                            feedback = self.interface.prompt_multiline("请输入您的修改意见")
+                            if not feedback.strip():
+                                print("修改意见为空，取消修改。")
+                                continue
+                            
+                            self.log.info(f"正在根据意见修改选项 {idx+1} ...")
+                            # Trigger the AI to revise based on feedback
+                            # We need a generic revision prompt
+                            revise_tpl = self.prompts.get("global_system", "")
+                            # Since we don't have the original context here easily, we rely on the provider
+                            # For simplicity in the loop, we will prompt the provider with the feedback + original text
+                            revised_text = self._revise_candidate(candidates[idx].content, feedback)
+                            
+                            candidates[idx].content = revised_text
+                            self.state.save()
+                            self.log.info(f"选项 {idx+1} 已根据您的意见更新！")
+                        else:
+                            print("无效的编号。")
+                    except ValueError:
+                        print("格式错误，请使用 e1, e2 等。")
+                    except Exception as e:
+                        print(f"修改失败: {e}")
+                    continue
                 
-                refined_cand = self._interactive_refine_session(target_cand, step_name)
-                if refined_cand:
-                    candidates.append(refined_cand)
-                    setattr(self.state, candidates_field, candidates)
-                    self.state.save()
-                    self.interface.notify("成功", "精修完成，已作为新版本添加。")
-
-            elif choice_idx == 3: # 上传
-                path = self.interface.prompt_input("请输入文件的绝对路径")
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    user_cand = ArtifactCandidate(id="用户上传", content=content, selected=True)
-                    candidates.append(user_cand)
-                    setattr(self.state, candidates_field, candidates)
-                    self.state.save()
-                    self.interface.notify("成功", "文件已加载。")
+                # Default selection (1-N)
+                if user_in.isdigit():
+                    idx = int(user_in) - 1
+                    if 0 <= idx < len(candidates):
+                        selected_candidate = candidates[idx]
+                        selected_candidate.selected = True
+                        self.log.info(f"用户选择了候选项: 选项 {idx+1}")
+                        break
+                    else:
+                        print("无效的编号。")
                 else:
-                    self.interface.notify("错误", f"找不到文件: {path}")
-
-        selected_candidate.selected = True
+                    print("无法识别的输入，请重试。")
+            
+        # 保存状态
         self.state.system_status = "running"
         self.state.save()
         return selected_candidate
 
-    def _interactive_refine_session(self, base_cand: ArtifactCandidate, step_name: str) -> Optional[ArtifactCandidate]:
+    def _revise_candidate(self, original_text: str, feedback: str) -> str:
         """
-        交互式精修会话。
+        根据用户意见修改指定的候选方案，通用方法。
         """
-        current_content = base_cand.content
-        refine_dir = f"{step_name}/refinements"
-        try:
-             os.makedirs(self.store._abs(refine_dir), exist_ok=True)
-        except Exception:
-            pass
+        sys_prompt = "你是一位专业的网文主编与作者，请听从用户的修改意见，对给定的文案进行针对性修改。"
+        user_prompt = f"【原始内容】\n{original_text}\n\n【修改意见】\n{feedback}\n\n请严格尊崇修改意见，重新输出修改后的完整内容（不要包含任何解说或多余的 Markdown 代码块前缀）："
         
-        while True:
-            # 解析章节
-            sections = self._parse_sections(current_content)
-            has_structure = len(sections) > 1
-            
-            # 可视化结构
-            section_opts = [f"{t[0]} ({len(t[1])} 字)" for t in sections] if has_structure else []
-            
-            menu_ops = ["保存并退出 (Save & Exit)", "放弃 (Cancel)"]
-            if has_structure:
-                menu_ops.extend(["查看章节 (View Section)", "修改章节 (Modify Section - AI)", "手动编辑章节 (Edit Section - Manual)"])
-            menu_ops.extend(["查看全文 (View Full Text)", "修改全文 (Modify Full Text - AI)", "手动编辑全文 (Edit Full Text - Manual)", "一致性检查 (Check Consistency)"])
-            
-            choice = self.interface.ask_choice(
-                f"精修模式 (当前基底: {base_cand.id}) - 总字数: {len(current_content)}", 
-                menu_ops
-            )
-            
-            op = menu_ops[choice]
-            
-            if "放弃" in op:
-                return None
-            
-            if "保存" in op:
-                 new_id = f"{base_cand.id}_精修版_{int(time.time())}"
-                 return ArtifactCandidate(id=new_id, content=current_content)
-                 
-            if "查看章节" in op:
-                s_idx = self.interface.ask_choice("选择要查看的章节:", section_opts)
-                self.interface.notify(sections[s_idx][0], sections[s_idx][1])
-                
-            if "修改章节 (Modify Section - AI)" in op:
-                s_idx = self.interface.ask_choice("选择要修改的章节:", section_opts)
-                feedback = self.interface.prompt_input("请输入您的修改意见")
-                if feedback:
-                    self.interface.notify("AI 助手", "正在根据您的意见进行修改...")
-                    timestamp = int(time.time())
-                    rel_path = f"{refine_dir}/{base_cand.id}_mod_{s_idx}_{timestamp}.md"
-                    target_text = sections[s_idx][1]
-                    
-                    try:
-                        revised = self._call_llm_refine(target_text, feedback, rel_path)
-                        current_content = self._replace_section(current_content, sections, s_idx, revised)
-                        self.interface.notify("成功", "章节修改已应用。")
-                    except Exception as e:
-                        self.interface.notify("错误", f"修改失败: {e}")
-            
-            if "手动编辑章节" in op:
-                s_idx = self.interface.ask_choice("选择要手动编辑的章节:", section_opts)
-                original_text = sections[s_idx][1]
-                print(f"--- 原文 ---\n{original_text}\n---")
-                new_text = self.interface.prompt_multiline("请输入新的章节内容")
-                if new_text:
-                    current_content = self._replace_section(current_content, sections, s_idx, new_text)
-                    self.interface.notify("成功", "手动修改已应用。")
-
-            if "查看全文" in op:
-                self.interface.notify("全文预览", current_content[:2000] + "\n...(已截断，太长无法完全显示)")
-
-            if "修改全文 (Modify Full Text - AI)" in op:
-                if self.interface.confirm("修改全文可能会导致内容不稳定，确定继续吗?"):
-                     feedback = self.interface.prompt_input("请输入针对全文的修改意见")
-                     if feedback:
-                        self.interface.notify("AI 助手", "正在修改全文，请稍候...")
-                        timestamp = int(time.time())
-                        rel_path = f"{refine_dir}/{base_cand.id}_mod_all_{timestamp}.md"
-                        try:
-                            current_content = self._call_llm_refine(current_content, feedback, rel_path)
-                            self.interface.notify("成功", "全文修改已应用。")
-                        except Exception as e:
-                             self.interface.notify("错误", f"失败: {e}")
-            
-            if "手动编辑全文" in op:
-                 if self.interface.confirm("手动重写全文?"):
-                     new_full = self.interface.prompt_multiline("请输入新的全文内容")
-                     if new_full:
-                         current_content = new_full
-                         self.interface.notify("成功", "全文已手动覆盖。")
-
-            if "一致性检查" in op:
-                 self.interface.notify("AI 助手", "正在运行检查...")
-                 report = self._run_consistency_check(current_content, step_name)
-                 self.interface.notify("检查报告", report)
-
-    def _parse_sections(self, content: str) -> List[Tuple[str, str]]:
-        # 相同的正则逻辑
-        pattern = r"(^|\n)(#{2,3}\s+.*)"
-        parts = re.split(pattern, content)
-        sections = []
-        if len(parts) < 2:
-            return []
+        # 使用 provider 的非流式 generate 快速生成
+        response = self.provider.generate(system=sys_prompt, prompt=user_prompt)
+        text = response.text.strip()
         
-        current_body = parts[0]
-        if current_body.strip():
-            sections.append(("导语", current_body))
-            
-        i = 1
-        while i < len(parts) - 1:
-            sep = parts[i]
-            title_line = parts[i + 1].strip()
-            body_text = parts[i + 2] if i + 2 < len(parts) else ""
-            full_section = f"{sep}{title_line}{body_text}"
-            clean_title = title_line.lstrip("#").strip()
-            sections.append((clean_title, full_section))
-            i += 3
-        return sections
-
-    def _replace_section(self, full_content: str, sections: List[Tuple[str, str]], idx: int, new_text: str) -> str:
-        sections[idx] = (sections[idx][0], new_text)
-        new_full = ""
-        for title, body in sections:
-            new_full += body
-        return new_full
-
-    def _call_llm_refine(self, content: str, feedback: str, rel_path: str) -> str:
-        # Prompt 逻辑保持不变，但日志中文化
-        refine_cfg = self.prompts.get("refinement", {})
-        system_prompt = refine_cfg.get("system", "你是一位专业的网文编辑。")
-        user_template = refine_cfg.get("user_template", "反馈意见: {feedback}\n原始内容: {content}")
-        prompt = user_template.format(feedback=feedback, content=content)
+        # 清理多余的 Markdown backticks
+        import re
+        text = re.sub(r"^```[a-zA-Z]*\n", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^```", "", text, flags=re.MULTILINE)
         
-        abs_path = self.store._abs(rel_path)
-        full_text = ""
-        
-        try:
-             with open(abs_path, "w", encoding="utf-8") as f:
-                if hasattr(self.provider, "stream_generate"):
-                    # 如果不需要在 CLI 打印密集的流式点，可保持安静
-                    for chunk in self.provider.stream_generate(system=system_prompt, prompt=prompt):
-                        f.write(chunk)
-                        f.flush()
-                        full_text += chunk
-                else:
-                    res = self.provider.generate(system=system_prompt, prompt=prompt)
-                    full_text = res.text
-                    f.write(full_text)
-        except Exception as e:
-            self.log.error(f"精修调用失败: {e}")
-            raise e
-        return full_text
-
-    def _run_consistency_check(self, content: str, step_name: str) -> str:
-        # 占位符
-        return "一致性检查通过 (Mock功能)。"
+        return text
 
     # 场景处理与 AB 测试逻辑
     def process_scene(self, scene_node: SceneNode, outline_path: str, bible_path: str):
@@ -347,17 +179,23 @@ class WorkflowEngine:
          # Output path is now .json
          rel_path = f"05_drafting/scenes/scene_{scene_node.id:03d}.json"
          
+         from pipeline.step_05_drafting import DraftingStep
+         step_ctx = {
+             "cfg": self.ctx["cfg"],
+             "prompts": self.ctx["prompts"],
+             "provider": self.ctx["provider"],
+             "store": self.ctx["store"],
+             "log": self.ctx["log"],
+             "jsonl": self.ctx["jsonl"],
+         }
+         drafting_step = DraftingStep(step_ctx)
+         
          # 1. Initial Draft
-         text_result = draft_single_scene(
+         text_result = drafting_step.draft_single_scene(
              scene_data=scene_node.meta,
-             cfg=self.ctx["cfg"],
-             prompts=self.ctx["prompts"],
-             provider=self.ctx["provider"],
              outline_path=outline_path,
              bible_path=bible_path,
-             store=self.ctx["store"],
              rel_path=rel_path,
-             log=self.ctx["log"],
              jsonl=self.ctx["jsonl"],
              run_id=self.ctx["run_id"]
          )
@@ -526,19 +364,25 @@ class WorkflowEngine:
                 cid = f"v{i+1}"
                 # Output path is now .json
                 rel_path = f"05_drafting/scenes/scene_{scene_node.id:03d}_{cid}.json"
+                from pipeline.step_05_drafting import DraftingStep
+                step_ctx = {
+                    "cfg": self.ctx["cfg"],
+                    "prompts": self.ctx["prompts"],
+                    "provider": self.ctx["provider"],
+                    "store": self.ctx["store"],
+                    "log": self.log,
+                    "jsonl": self.ctx["jsonl"],
+                }
+                drafting_step = DraftingStep(step_ctx)
+
                 future = executor.submit(
-                     draft_single_scene,
-                     scene_data=scene_node.meta,
-                     cfg=self.ctx["cfg"],
-                     prompts=self.ctx["prompts"],
-                     provider=self.ctx["provider"],
-                     outline_path=outline_path,
-                     bible_path=bible_path,
-                     store=self.ctx["store"],
-                     rel_path=rel_path,
-                     log=None,
-                     jsonl=self.ctx["jsonl"],
-                     run_id=self.ctx["run_id"]
+                      drafting_step.draft_single_scene,
+                      scene_data=scene_node.meta,
+                      outline_path=outline_path,
+                      bible_path=bible_path,
+                      rel_path=rel_path,
+                      jsonl=self.ctx["jsonl"],
+                      run_id=self.ctx["run_id"]
                 )
                 futures[future] = (cid, rel_path)
         
@@ -558,7 +402,12 @@ class WorkflowEngine:
         if self.selection_mode == "auto":
             winner_id = self._auto_evaluate(scene_node, candidates, bible_path)
         else:
-            winner_id = self._manual_evaluate_ui(scene_node, candidates) # Updated Method
+            winner_id = self._manual_evaluate_ui(
+                scene_node,
+                candidates,
+                outline_path=outline_path,
+                bible_path=bible_path,
+            )
 
         selected = next((c for c in candidates if c.id == winner_id), candidates[0])
         selected.selected = True
@@ -585,7 +434,161 @@ class WorkflowEngine:
     def _auto_evaluate(self, scene_node, candidates, bible_path):
         return candidates[0].id
 
-    def _manual_evaluate_ui(self, scene_node: SceneNode, candidates: List[SceneCandidate]) -> str:
-        options = [f"[{c.id}] 长度: {c.meta.get('char_len', 0)} 字" for c in candidates]
-        idx = self.interface.ask_choice(f"场景 {scene_node.id} - 用于 A/B 测试的人工评审:", options)
-        return candidates[idx].id
+    def _manual_evaluate_ui(
+        self,
+        scene_node: SceneNode,
+        candidates: List[SceneCandidate],
+        *,
+        outline_path: str,
+        bible_path: str,
+    ) -> str:
+        """
+        Interactive A/B evaluation UI for a single scene.
+        Supports view / select / feedback-rewrite / reroll.
+        """
+        import json
+
+        def _load_candidate_text(c: SceneCandidate) -> str:
+            try:
+                if c.content_path and c.content_path.endswith(".json") and os.path.exists(c.content_path):
+                    with open(c.content_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return (data.get("content") or "").strip()
+                if c.content_path and os.path.exists(c.content_path):
+                    with open(c.content_path, "r", encoding="utf-8") as f:
+                        return f.read().strip()
+            except Exception as e:
+                self.log.error(f"Failed to load candidate {c.id}: {e}")
+            return ""
+
+        def _save_candidate_text(c: SceneCandidate, new_text: str) -> None:
+            if not c.content_path:
+                raise ValueError("candidate.content_path is empty")
+            if c.content_path.endswith(".json"):
+                with open(c.content_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data["content"] = new_text
+                with open(c.content_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            else:
+                with open(c.content_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(new_text)
+            c.meta["char_len"] = len(new_text)
+
+        def _reroll_all() -> List[SceneCandidate]:
+            self.log.info(f"场景 {scene_node.id}: reroll all candidates...")
+            new_candidates: List[SceneCandidate] = []
+            futures = {}
+            with ThreadPoolExecutor(max_workers=self.num_candidates) as executor:
+                for i in range(self.num_candidates):
+                    cid = f"v{i+1}"
+                    rel_path = f"05_drafting/scenes/scene_{scene_node.id:03d}_{cid}.json"
+                    from pipeline.step_05_drafting import DraftingStep
+
+                    step_ctx = {
+                        "cfg": self.ctx["cfg"],
+                        "prompts": self.ctx["prompts"],
+                        "provider": self.ctx["provider"],
+                        "store": self.ctx["store"],
+                        "log": self.log,
+                        "jsonl": self.ctx["jsonl"],
+                    }
+                    drafting_step = DraftingStep(step_ctx)
+                    future = executor.submit(
+                        drafting_step.draft_single_scene,
+                        scene_data=scene_node.meta,
+                        outline_path=outline_path,
+                        bible_path=bible_path,
+                        rel_path=rel_path,
+                        jsonl=self.ctx["jsonl"],
+                        run_id=self.ctx["run_id"],
+                    )
+                    futures[future] = (cid, rel_path)
+
+            for f in as_completed(futures):
+                cid, rpath = futures[f]
+                try:
+                    text = f.result()
+                    new_candidates.append(
+                        SceneCandidate(
+                            id=cid,
+                            content_path=self.ctx["store"]._abs(rpath),
+                            meta={"char_len": len(text)},
+                        )
+                    )
+                except Exception as e:
+                    self.log.error(f"Reroll candidate {cid} failed: {e}")
+
+            if not new_candidates:
+                raise RuntimeError("Reroll produced no candidates.")
+            return new_candidates
+
+        while True:
+            print(f"\n场景 {scene_node.id} 候选版本:")
+            for i, c in enumerate(candidates):
+                text = _load_candidate_text(c)
+                preview = text[:120].replace("\n", " ")
+                if len(text) > 120:
+                    preview += "..."
+                print(f"  {i+1}. [{c.id}] 字数: {c.meta.get('char_len', len(text))} 预览: {preview}")
+
+            print("\n操作指引:")
+            print("  [1-N] 选择候选版本")
+            print("  [vN]  查看候选版本全文 (例: v1)")
+            print("  [eN]  对候选版本提意见并重写 (例: e1)")
+            print("  [r]   全部重新生成 (Reroll)")
+
+            user_in = self.interface.prompt_input("请选择操作", default="1").lower().strip()
+
+            if user_in == "r":
+                candidates = _reroll_all()
+                scene_node.candidates = candidates
+                self.state.save()
+                continue
+
+            if user_in.startswith("v"):
+                try:
+                    idx = int(user_in[1:]) - 1
+                    if 0 <= idx < len(candidates):
+                        print(f"\n--- 候选 {idx+1} [{candidates[idx].id}] 全文 ---\n")
+                        print(_load_candidate_text(candidates[idx]))
+                        print("\n------------------------------\n")
+                        self.interface.prompt_input("按回车继续...", default="")
+                    else:
+                        print("无效编号。")
+                except ValueError:
+                    print("格式错误，请使用 v1, v2 ...")
+                continue
+
+            if user_in.startswith("e"):
+                try:
+                    idx = int(user_in[1:]) - 1
+                    if 0 <= idx < len(candidates):
+                        feedback = self.interface.prompt_multiline("请输入您的修改意见")
+                        if not feedback.strip():
+                            print("修改意见为空，取消修改。")
+                            continue
+                        original = _load_candidate_text(candidates[idx])
+                        if not original:
+                            print("候选内容为空，无法修改。")
+                            continue
+                        revised = self._revise_candidate(original, feedback)
+                        _save_candidate_text(candidates[idx], revised)
+                        self.state.save()
+                        self.log.info(f"场景 {scene_node.id}: candidate {candidates[idx].id} revised.")
+                    else:
+                        print("无效编号。")
+                except ValueError:
+                    print("格式错误，请使用 e1, e2 ...")
+                except Exception as e:
+                    print(f"修改失败: {e}")
+                continue
+
+            if user_in.isdigit():
+                idx = int(user_in) - 1
+                if 0 <= idx < len(candidates):
+                    return candidates[idx].id
+                print("无效编号。")
+                continue
+
+            print("无法识别的输入，请重试。")

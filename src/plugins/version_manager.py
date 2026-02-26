@@ -34,6 +34,11 @@ class ProjectVersionManager:
             if os.path.exists(std_draft):
                 versions.append(self._parse_file_info(std_draft, "drafting_selected"))
                 
+            # Legacy drafting support (scene_xxx.md directly in draft folder)
+            legacy_draft = os.path.join(drafting_dir, f"scene_{scene_id:03d}.md")
+            if os.path.exists(legacy_draft):
+                 versions.append(self._parse_file_info(legacy_draft, "drafting_legacy_md"))
+                 
         # 2. Check polished versions
         polish_dir = self.store._abs("06_polishing/scenes")
         if os.path.exists(polish_dir):

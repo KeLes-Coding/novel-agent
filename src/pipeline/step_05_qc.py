@@ -119,79 +119,109 @@ def _load_scene_plan(scene_plan_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
-    store = step_ctx["store"]
+from pipeline.base_step import PipelineStep
 
-    scene_plan_path = step_ctx["scene_plan_path"]
-    draft_path = step_ctx["draft_path"]
-    bible_path = step_ctx["bible_path"]
+class QCStep(PipelineStep):
+    def run(self) -> Dict[str, Any]:
+        scene_plan_path = self.context.get("scene_plan_path")
+        draft_path = self.context.get("draft_path")
+        bible_path = self.context.get("bible_path")
 
-    scene_plan = _load_scene_plan(scene_plan_path)
-    scenes = scene_plan.get("scenes", [])
+        scene_plan = _load_scene_plan(scene_plan_path)
+        scenes_meta = scene_plan.get("scenes", [])
 
-    draft_text = _read_text(draft_path)
-    bible_text = _read_text(bible_path)
+        draft_text = _read_text(draft_path) if os.path.exists(draft_path) else ""
+        bible_text = _read_text(bible_path) if os.path.exists(bible_path) else ""
 
-    # 找到所有 scene 文件
-    # 这里不依赖 scene_plan 数量，直接扫目录
-    scenes_glob = os.path.join(os.path.dirname(draft_path), "scenes", "scene_*.md")
-    scene_files = sorted(glob.glob(scenes_glob))
+        scenes_glob = os.path.join(os.path.dirname(draft_path), "scenes", "scene_*.md")
+        scene_files = sorted(glob.glob(scenes_glob))
 
-    scene_reports: List[Dict[str, Any]] = []
-    for idx, sp in enumerate(scene_files, start=1):
-        txt = _read_text(sp)
-        rep = {
-            "scene_file": sp,
-            "basic": {
-                "char_len": len(txt),
-                "tokenized": _repetition_metrics(txt)["token_count"],
+        scene_reports: List[Dict[str, Any]] = []
+        global_verdict = "PASS"
+        global_warnings = []
+        
+        # State scenes mapping for reroll triggers
+        state_scenes = {f"scene_{s.id:03d}": s for s in getattr(self, "state", None).scenes} if hasattr(self, "state") and self.state else {}
+
+        for idx, sp in enumerate(scene_files, start=1):
+            txt = _read_text(sp)
+            rep_metrics = _repetition_metrics(txt)
+            cliffhanger = _find_cliffhanger_signals(txt)
+            single_fl = _single_female_lead_risk(txt)
+            
+            # 校验指标
+            scene_verdict = "PASS"
+            rep_4 = rep_metrics["ngram"]["4"].get("repeat_ratio", 0.0)
+            if rep_4 >= 0.15:
+                scene_verdict = "FAIL"
+                global_warnings.append(f"文件 {os.path.basename(sp)} 重复率极高 ({rep_4})，已标记为 FAIL")
+            elif rep_4 >= 0.08:
+                scene_verdict = "WARN"
+
+            # 拦截重写逻辑 (Reroll trigger)
+            if scene_verdict == "FAIL" and self.state:
+                base_name = os.path.splitext(os.path.basename(sp))[0]
+                # base_name format like scene_001
+                if base_name in state_scenes:
+                    node = state_scenes[base_name]
+                    if node.status == "done":
+                        node.status = "pending"  # 回拨状态触发 drafting Reroll
+                        if self.log:
+                            self.log.warning(f"Interceptor triggered: Scene {node.id} quality check FAIL. Status rolled back to 'pending'.")
+
+            rep = {
+                "scene_file": sp,
+                "verdict": scene_verdict,
+                "basic": {
+                    "char_len": len(txt),
+                    "tokenized": rep_metrics["token_count"],
+                },
+                "repetition": rep_metrics,
+                "cliffhanger": cliffhanger,
+                "single_fl_risk": single_fl,
+            }
+            scene_reports.append(rep)
+            if scene_verdict == "FAIL":
+                global_verdict = "FAIL"
+            elif scene_verdict == "WARN" and global_verdict == "PASS":
+                global_verdict = "WARN"
+
+        overall = {
+            "draft": {
+                "char_len": len(draft_text),
+                "repetition": _repetition_metrics(draft_text),
+                "single_fl_risk": _single_female_lead_risk(draft_text),
             },
-            "repetition": _repetition_metrics(txt),
-            "cliffhanger": _find_cliffhanger_signals(txt),
-            "single_fl_risk": _single_female_lead_risk(txt),
+            "bible": {
+                "char_len": len(bible_text),
+            },
+            "scene_plan": {
+                "planned_scene_count": len(scenes_meta),
+                "generated_scene_files": len(scene_files),
+            },
         }
-        scene_reports.append(rep)
 
-    overall = {
-        "draft": {
-            "char_len": len(draft_text),
-            "repetition": _repetition_metrics(draft_text),
-            "single_fl_risk": _single_female_lead_risk(draft_text),
-        },
-        "bible": {
-            "char_len": len(bible_text),
-        },
-        "scene_plan": {
-            "planned_scene_count": len(scenes),
-            "generated_scene_files": len(scene_files),
-        },
-    }
+        if overall["scene_plan"]["generated_scene_files"] == 0:
+            global_verdict = "FAIL"
+            global_warnings.append("未生成任何 scene 文件")
 
-    # 给一个简单结论等级（你后面可调阈值）
-    rep_ratio_4 = overall["draft"]["repetition"]["ngram"]["4"].get("repeat_ratio", 0.0)
-    fl_score = overall["draft"]["single_fl_risk"]["risk_score"]
+        report = {
+            "meta": {
+                "generated_at": datetime.datetime.now().isoformat(),
+                "verdict": global_verdict,
+                "warnings": global_warnings,
+            },
+            "overall": overall,
+            "scenes": scene_reports,
+        }
 
-    verdict = "PASS"
-    warnings = []
-    if rep_ratio_4 >= 0.08:
-        verdict = "WARN"
-        warnings.append(f"4-gram 重复率偏高：{rep_ratio_4}")
-    if fl_score >= 8:
-        verdict = "WARN"
-        warnings.append(f"疑似多女主/暧昧信号偏多：risk_score={fl_score}")
-    if overall["scene_plan"]["generated_scene_files"] == 0:
-        verdict = "FAIL"
-        warnings.append("未生成任何 scene 文件")
+        out_path = self.store.save_json("05_qc/qc_report.json", report)
+        
+        # 保存被修改状态的场景树
+        if self.state:
+            self.state.save()
 
-    report = {
-        "meta": {
-            "generated_at": datetime.datetime.now().isoformat(),
-            "verdict": verdict,
-            "warnings": warnings,
-        },
-        "overall": overall,
-        "scenes": scene_reports,
-    }
+        return {"qc_report_path": out_path, "verdict": global_verdict, "warnings": global_warnings}
 
-    out_path = store.save_json("05_qc/qc_report.json", report)
-    return {"qc_report_path": out_path, "verdict": verdict, "warnings": warnings}
+def run(step_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    return QCStep(step_ctx).run()

@@ -61,16 +61,24 @@ class WikiUpdater:
                 "new_facts": []
             }
 
-    def patch_bible(self, bible_path: str, new_facts: list[str], chapter_title: str) -> None:
+    def patch_bible(self, bible_path: str, new_facts: list[str], chapter_title: str, branch_id: str = None) -> str:
         """
-        Append new facts to the bible file.
+        Append new facts to the bible file. Uses Copy-On-Write if branch_id is provided.
+        Returns the path to the updated bible.
         """
         if not new_facts:
-            return
+            return bible_path
 
-        if not os.path.exists(bible_path):
-             # Creates if not exists (though typically it should exist)
-             with open(bible_path, "w", encoding="utf-8") as f:
+        target_path = bible_path
+        if branch_id:
+            import shutil
+            base, ext = os.path.splitext(bible_path)
+            target_path = f"{base}_branch_{branch_id}{ext}"
+            if not os.path.exists(target_path) and os.path.exists(bible_path):
+                shutil.copy2(bible_path, target_path)
+
+        if not os.path.exists(target_path):
+             with open(target_path, "w", encoding="utf-8") as f:
                  f.write("# Project Bible\n\n")
 
         append_content = f"\n\n## [New] Dynamic Updates ({chapter_title})\n"
@@ -78,10 +86,12 @@ class WikiUpdater:
             append_content += f"- {fact}\n"
             
         try:
-            with open(bible_path, "a", encoding="utf-8") as f:
+            with open(target_path, "a", encoding="utf-8") as f:
                 f.write(append_content)
+            return target_path
         except Exception as e:
             print(f"Failed to patch bible: {e}") 
+            return bible_path
 
 
     def consolidate_summaries(self, summaries: list[str]) -> str:

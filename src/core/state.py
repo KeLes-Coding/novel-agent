@@ -103,6 +103,8 @@ class ProjectState:
     archived_summaries: List[str] = field(default_factory=list)
     # 最后一个已归档的场景 ID (Last scene ID included in archives)
     last_archived_scene_id: int = 0
+    # 最后一个已归档场景在其分支线上的深度
+    last_archived_depth: int = 0
 
     scenes: List[SceneNode] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
@@ -132,8 +134,13 @@ class ProjectState:
         idea_cands = data.pop("idea_candidates", [])
         outline_cands = data.pop("outline_candidates", [])
         bible_cands = data.pop("bible_candidates", [])
+        scene_plan_cands = data.pop("scene_plan_candidates", [])
 
         state = cls(**data)
+        
+        # 兼容旧版本可能缺失的 depth 值
+        if not hasattr(state, "last_archived_depth"):
+             state.last_archived_depth = state.last_archived_scene_id
 
         # 恢复 Scenes (使用递归的 from_dict)
         state.scenes = []
@@ -144,5 +151,6 @@ class ProjectState:
         state.idea_candidates = [ArtifactCandidate(**c) for c in idea_cands]
         state.outline_candidates = [ArtifactCandidate(**c) for c in outline_cands]
         state.bible_candidates = [ArtifactCandidate(**c) for c in bible_cands]
+        state.scene_plan_candidates = [ArtifactCandidate(**c) for c in scene_plan_cands]
 
         return state

@@ -13,12 +13,11 @@ from providers.factory import build_provider
 from storage.local_store import LocalStore
 from core.state import ProjectState, SceneNode, ArtifactCandidate
 import core.fsm as fsm_lib
-# from core.fsm import StateMachine, ProjectPhase
+from core.fsm import ProjectPhase
 
 from pipeline.step_01_ideation import run as run_ideation
 from pipeline.step_02_outline import run as run_outline
 from pipeline.step_03_bible import run as run_bible
-from pipeline.step_05_drafting import draft_single_scene
 
 from core.workflow import WorkflowEngine
 from interfaces.base import UserInterface
@@ -135,12 +134,9 @@ class ProjectManager:
         elif phase_name == "drafting":
             return any(s.status == "done" and self.state._abs_path_exists(s.content_path) for s in self.state.scenes)
         elif phase_name == "review":
-            # For review, checking if any scene is done and has a polishing json
             for s in self.state.scenes:
-                if s.status == "done":
-                    polish_path = self.store._abs(f"06_polishing/scenes/scene_{s.id:03d}.json")
-                    if os.path.exists(polish_path):
-                         return True
+                if s.status == "done" and "06_polishing" in str(s.content_path) and os.path.exists(s.content_path):
+                    return True
             return False
         return False
 
@@ -260,6 +256,27 @@ class ProjectManager:
         log = self._get_workflow(step_name).log
         workflow = self._get_workflow(step_name)
 
+        user_input_mode = 0
+        if not self.state.idea_candidates and not self.state.idea_path:
+            user_input_mode = self.interface.ask_choice(
+                "准备开始生成创意，请选择创意的提供方式:",
+                ["由 AI 自由头脑风暴生成 (自动模式)", "由我提供一个初步的想法 (作为核心灵感附加给 AI)", "直接输入完整的创意文本 (完全跳过 AI 生成)"]
+            )
+            
+            if user_input_mode == 1:
+                user_idea = self.interface.prompt_multiline("请输入您的初步想法/灵感")
+                if "content" not in self.config:
+                    self.config["content"] = {}
+                self.config["content"]["user_prompt"] = user_idea
+            elif user_input_mode == 2:
+                user_idea = self.interface.prompt_multiline("请输入完整的创意内容 (此步骤后将直接进入大纲生成)")
+                final_path = self.store.save_text("01_ideation/ideas_selected.txt", user_idea)
+                self.state.idea_path = final_path
+                self.state.save()
+                log.info(f"人工创意已确认，直接进入下一阶段: {final_path}")
+                self.fsm.transition_to(fsm_lib.ProjectPhase.OUTLINE)
+                return
+
         log.info("开始创意生成...")
 
         def _generate_ideas() -> list:
@@ -277,6 +294,9 @@ class ProjectManager:
         self.state.idea_path = final_path
         self.state.save()
         log.info(f"创意已确认: {final_path}")
+        
+        # 推进到下一阶段
+        self.fsm.transition_to(fsm_lib.ProjectPhase.OUTLINE)
 
     def run_outline(self, force: bool = False):
         if not force and not self._prompt_rewrite("outline", self._reset_outline):
@@ -305,6 +325,9 @@ class ProjectManager:
         self.state.outline_path = self.store.save_text("02_outline/outline_selected.md", selected.content)
         self.state.save()
         log.info("大纲已确认。")
+        
+        # 推进到下一阶段
+        self.fsm.transition_to(fsm_lib.ProjectPhase.BIBLE)
 
     def run_bible(self, force: bool = False):
         if not force and not self._prompt_rewrite("bible", self._reset_bible):
@@ -333,6 +356,9 @@ class ProjectManager:
         self.state.bible_path = self.store.save_text("03_bible/bible_selected.md", selected.content)
         self.state.save()
         log.info("设定集已确认。")
+        
+        # 推进到下一阶段
+        self.fsm.transition_to(fsm_lib.ProjectPhase.SCENE_PLAN)
 
     def init_scenes(self, force: bool = False):
         if not force and not self._prompt_rewrite("scene_plan", self._reset_scene_plan):
@@ -365,6 +391,9 @@ class ProjectManager:
         self.state.scenes = scenes
         self.state.save()
         log.info(f"分场已确认，包含 {len(scenes)} 个根场景。")
+        
+        # 推进到下一阶段
+        self.fsm.transition_to(fsm_lib.ProjectPhase.DRAFTING)
 
     def run_drafting_loop(self, force: bool = False, auto_mode: bool = False):
         if not force and not self._prompt_rewrite("drafting", self._reset_drafting):
@@ -382,8 +411,10 @@ class ProjectManager:
 
         from core.context import ContextBuilder
         from agents.wiki_updater import WikiUpdater
-        self.ctx_builder = ContextBuilder(self.state, self.store)
+        from core.memory import MemoryManager
+        self.ctx_builder = ContextBuilder(self.state, self.store, self.config)
         self.wiki_updater = WikiUpdater(self.provider, self.prompts.get("global_system", ""))
+        self.memory = MemoryManager(self.state, self.wiki_updater, self.log)
         self.jsonl = self.logger_env["jsonl"]
 
         # 遍历所有根节点 (及其子节点)
@@ -391,6 +422,8 @@ class ProjectManager:
              self._process_scene_recursive(scene_node, auto_mode)
                  
         self.interface.notify("完成", "正文生成循环结束 (包含所有选中分支)。")
+        
+        # 推进到下一阶段
         self.fsm.transition_to(fsm_lib.ProjectPhase.REVIEW)
 
     def run_review(self, force: bool = False):
@@ -406,14 +439,22 @@ class ProjectManager:
         
         valid_scenes = []
         for s in done_scenes:
-             if s.content_path and os.path.exists(s.content_path):
-                 valid_scenes.append(s)
-             else:
-                 fallback = self.store._abs(f"05_drafting/scenes/scene_{s.id:03d}.json")
-                 if os.path.exists(fallback):
-                     valid_scenes.append(s)
-                 else:
-                     self.log.warning(f"Scene {s.id} is marked done but no files found. Cannot review.")
+            if s.content_path and os.path.exists(s.content_path):
+                valid_scenes.append(s)
+            else:
+                fallback_json = self.store._abs(f"05_drafting/scenes/scene_{s.id:03d}.json")
+                fallback_md = getattr(s, "fallback_md", self.store._abs(f"05_drafting/scenes/scene_{s.id:03d}_{s.selected_candidate_id}.json") if s.selected_candidate_id else "")
+
+                if os.path.exists(fallback_json):
+                    s.content_path = fallback_json
+                    valid_scenes.append(s)
+                elif fallback_md and os.path.exists(fallback_md):
+                    s.content_path = fallback_md
+                    valid_scenes.append(s)
+                else:
+                    self.log.warning(f"Scene {s.id} is marked done but no valid drafted files found. Cannot review. Consider rerolling drafting for this scene.")
+                    # 触发状态回拨
+                    s.status = "pending"
                      
         if not valid_scenes:
             self.log.warning("没有可供 Review 的有效文件。")
@@ -523,7 +564,8 @@ class ProjectManager:
         self.interface.notify("导出完成", f"最终稿和独立章节已保存至 {self.store._abs(export_dir)}")
         
         self.fsm.transition_to(fsm_lib.ProjectPhase.DONE)
-        self.execute_next_step()
+        self.state.save()
+        self.log.info("导出操作已完成，项目完结。")
 
     def _process_scene_recursive(self, scene_node: SceneNode, auto_mode: bool):
         """递归处理场景节点 (支持分支选择)"""
@@ -578,71 +620,20 @@ class ProjectManager:
             # 2.1 触发动态设定更新 (Dynamic Bible Update)
             if new_facts:
                 self.log.info(f"Scene {scene_node.id} triggered bible update with {len(new_facts)} new facts.")
-                self.wiki_updater.patch_bible(
+                new_bible_path = self.wiki_updater.patch_bible(
                     self.state.bible_path, 
                     new_facts, 
-                    scene_node.title
+                    scene_node.title,
+                    branch_id=str(scene_node.id)
                 )
+                self.log.info(f"Bible patched: {new_bible_path}")
             
             # 2.2 触发记忆归档
-            self._consolidate_memory(scene_node.id)
+            self.memory.consolidate_memory(scene_node.id)
             
         except Exception as e:
             self.log.error(f"场景 {scene_node.id} 处理失败: {e}")
             raise e
-
-    def _consolidate_memory(self, current_scene_id: int):
-        """
-        Check if we need to consolidate old scene summaries into archive.
-        Buffer: Keep last 5 scenes active. Archive scenes before that in batches of 5.
-        """
-        # Buffer size = 5. We need at least 10 scenes since last archive to trigger a new archive of 5.
-        # Actually, let's keep it simple:
-        # If (current_scene_id - last_archived) >= 10:
-        #    Archive range: [last_archived + 1, last_archived + 5]
-        #    New last_archived = last_archived + 5
-        
-        last_archived = self.state.last_archived_scene_id
-        if (current_scene_id - last_archived) >= 10:
-            start_id = last_archived + 1
-            end_id = last_archived + 5
-            
-            self.log.info(f"Consolidating memory for scenes {start_id} to {end_id} ...")
-            
-            # Find these scenes
-            # Note: self.state.scenes is a list, but IDs might not be continuous indices if we have branches.
-            # However, for linear history (archived memory), we usually track the 'main timeline'.
-            # Simplification: We only archive linear segments. 
-            # Or we just find scenes by ID if IDs are globally unique and sequential-ish.
-            
-            scenes_to_archive = []
-            for sid in range(start_id, end_id + 1):
-                # Find scene with this ID
-                # FIXME: This linear search is slow for large N, but N is small for now.
-                # Also, we need to handle if scene ID doesn't exist (e.g. skipped numbers?)
-                # Assumes scenes have sequential IDs for now.
-                node = next((s for s in self.state.scenes if s.id == sid), None)
-                if node:
-                    if node.summary:
-                        scenes_to_archive.append(node.summary)
-                    elif node.status == "done":
-                        # Only warn if it is done but has no summary
-                        self.log.warning(f"Scene {sid} is 'done' but missing summary.")
-                else:
-                    # Scene ID not found in current state. 
-                    # This is normal for branched narratives where IDs might be skipped on the current path,
-                    # or if the user deleted scenes. We silently ignore it to avoid log spam.
-                    pass
-            
-            if scenes_to_archive:
-                chapter_summary = self.wiki_updater.consolidate_summaries(scenes_to_archive)
-                self.state.archived_summaries.append(chapter_summary)
-                self.state.last_archived_scene_id = end_id
-                self.state.save()
-                self.log.info(f"Memory consolidated. New archive count: {len(self.state.archived_summaries)}")
-
-                self.state.save()
-                self.log.info(f"Memory consolidated. New archive count: {len(self.state.archived_summaries)}")
 
     def _handle_branches(self, scene_node: SceneNode, auto_mode: bool):
         """处理子分支选择与递归"""
