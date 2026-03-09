@@ -90,6 +90,7 @@ notification:
 
 workflow:
   interactive: true
+  drafting_mode: scene_by_scene
   branching:
     enabled: true
     num_candidates: 2

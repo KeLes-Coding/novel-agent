@@ -5,8 +5,8 @@ import time
 from typing import Dict, Any, Optional
 from jinja2 import Template
 
-
 from pipeline.base_step import PipelineStep
+
 
 class DraftingStep(PipelineStep):
     def draft_single_scene(
@@ -19,22 +19,22 @@ class DraftingStep(PipelineStep):
         run_id: str = "",
     ) -> str:
         """
-        Step 05: 单场景正文生成 (原子函数)
-    
+        Step 05: 单场景正文生成
+
         该函数由 WorkflowEngine 调用，支持：
-        1. Jinja2 Prompt 渲染 (注入 ContextBuilder 构建的 dynamic_context)
+        1. Jinja2 Prompt 渲染
         2. 流式生成
-        3. JSON 格式化输出 (保存 .json 和 .md 副本)
+        3. JSON 格式化输出（保存 .json 和 .md 副本）
         4. 返回完整文本供后续处理
         """
         # 1. 准备上下文
         render_ctx = scene_data.get("dynamic_context", {})
-    
+
         if not render_ctx:
             if self.log:
                 try:
                     self.log.warning("Missing dynamic_context in scene_data, using fallback.")
-                except:
+                except Exception:
                     pass
             render_ctx = {
                 "bible": "（未加载设定集）",
@@ -44,72 +44,96 @@ class DraftingStep(PipelineStep):
                 "scene_title": scene_data.get("title", "Unknown"),
                 "scene_meta": scene_data,
             }
-    
+
         # 2. 渲染 Prompt
         writer_tpl = self.prompts.get("drafting", {}).get("writer", "")
         if not writer_tpl:
             writer_tpl = "请根据以下细纲写出正文：\n{{ scene_meta.summary }}"
-    
+
         try:
             user_prompt = Template(writer_tpl).render(**render_ctx)
         except Exception as e:
             if self.log:
                 self.log.error(f"Template rendering failed: {e}")
             user_prompt = f"Prompt Render Error: {e}\n\nContext: {scene_data}"
-    
+
         sys_tpl = self.prompts.get("global_system", "")
         system_prompt = Template(sys_tpl).render(**render_ctx)
-    
+
         # 3. 准备输出路径
         if not rel_path.endswith(".json"):
-             rel_path += ".json"
-        
+            rel_path += ".json"
+
         abs_path = self.store._abs(rel_path)
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    
+
         if self.log:
             self.log.info(f"Drafting scene to {rel_path} ...")
-    
+
         # 4. 准备输出 (Sidecar MD stream + Console)
         md_path = abs_path.replace(".json", ".md")
-        
-        # 5. 执行生成 (流式收集)
+
+        # 5. 执行生成（场景级重试，失败后覆盖重写 .md）
+        full_text = ""
         full_text = ""
         start_time = time.time()
-        
-        try:
-            if hasattr(self.provider, "stream_generate"):
-                with open(md_path, "w", encoding="utf-8") as md_file:
-                    header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
-                    md_file.write(header)
-                    md_file.flush()
-                    
-                    if self.log:
-                        self.log.info(f"Start streaming to {md_path}...")
-                    
-                    buffer = []
-                    for chunk in self.provider.stream_generate(
-                        system=system_prompt,
-                        prompt=user_prompt,
-                        meta={"scene_id": render_ctx.get("scene_id")},
-                    ):
-                        md_file.write(chunk)
+        max_retries = int(
+            self.cfg.get("workflow", {}).get(
+                "drafting_scene_retries",
+                self.cfg.get("provider", {}).get("max_retries", 2),
+            )
+        )
+        max_retries = max(0, max_retries)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                if hasattr(self.provider, "stream_generate"):
+                    with open(md_path, "w", encoding="utf-8") as md_file:
+                        header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
+                        md_file.write(header)
                         md_file.flush()
-                        buffer.append(chunk)
-                    
-                    print("\n")
-                    full_text = "".join(buffer)
-            else:
-                full_text = self.provider.generate(system=system_prompt, prompt=user_prompt).text
-                with open(md_path, "w", encoding="utf-8") as md_file:
-                    header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
-                    md_file.write(header + full_text)
-    
-        except Exception as e:
-            if self.log:
-                self.log.error(f"Generation failed for {rel_path}: {e}")
-            raise e
-    
+
+                        if self.log:
+                            self.log.info(
+                                f"Start streaming to {md_path}... (attempt {attempt + 1}/{max_retries + 1})"
+                            )
+
+                        buffer = []
+                        for chunk in self.provider.stream_generate(
+                            system=system_prompt,
+                            prompt=user_prompt,
+                            meta={"scene_id": render_ctx.get("scene_id")},
+                        ):
+                            md_file.write(chunk)
+                            md_file.flush()
+                            buffer.append(chunk)
+
+                        print("\n")
+                        full_text = "".join(buffer)
+                else:
+                    full_text = self.provider.generate(system=system_prompt, prompt=user_prompt).text
+                    with open(md_path, "w", encoding="utf-8") as md_file:
+                        header = f"# {render_ctx.get('scene_title', '无标题')}\n\n"
+                        md_file.write(header + full_text)
+
+                break
+            except Exception as e:
+                last_error = e
+                if attempt >= max_retries:
+                    if self.log:
+                        self.log.error(f"Generation failed for {rel_path}: {e}")
+                    raise e
+                sleep_s = 0.8 * (2 ** attempt)
+                if self.log:
+                    self.log.warning(
+                        f"Generation attempt {attempt + 1}/{max_retries + 1} failed for {rel_path}: {e}; retrying in {sleep_s:.1f}s"
+                    )
+                time.sleep(sleep_s)
+
+        if last_error and not full_text:
+            raise last_error
+
         # 6. 保存 JSON
         draft_data = {
             "scene_id": render_ctx.get("scene_id"),
@@ -119,10 +143,10 @@ class DraftingStep(PipelineStep):
             "content": full_text,
             "meta": scene_data,
         }
-        
+
         with open(abs_path, "w", encoding="utf-8") as f:
             json.dump(draft_data, f, indent=2, ensure_ascii=False)
-    
+
         return full_text
 
     def run(self) -> Dict[str, Any]:

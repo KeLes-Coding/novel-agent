@@ -97,6 +97,9 @@ class ProjectState:
     outline_candidates: List[ArtifactCandidate] = field(default_factory=list)
     bible_candidates: List[ArtifactCandidate] = field(default_factory=list)
     scene_plan_candidates: List[ArtifactCandidate] = field(default_factory=list)
+    stale_phases: List[str] = field(default_factory=list)
+    change_sets: List[Dict[str, Any]] = field(default_factory=list)
+    checkpoints: List[Dict[str, Any]] = field(default_factory=list)
 
     # === Phase 2: Memory Enhancement ===
     # 归档的卷摘要列表 (List of Chapter Summaries)
@@ -108,6 +111,13 @@ class ProjectState:
 
     scenes: List[SceneNode] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
+
+    def _abs_path_exists(self, path: str) -> bool:
+        if not path:
+            return False
+        if os.path.isabs(path):
+            return os.path.exists(path)
+        return os.path.exists(os.path.join(self.run_dir, path))
 
     def save(self):
         path = os.path.join(self.run_dir, "state.json")

@@ -30,6 +30,12 @@ def main():
     parser.add_argument(
         "--auto", action="store_true", help="自动执行 (基于当前状态推进)"
     )
+    parser.add_argument(
+        "--draft-mode",
+        choices=["scene_by_scene", "full_auto"],
+        help="Draft ?????scene_by_scene(?????) / full_auto(???)",
+    )
+
 
     args = parser.parse_args()
 
@@ -39,6 +45,7 @@ def main():
     # 初始化管理器
     try:
         manager = ProjectManager(config_path=args.config, interface=cli, run_id=args.run_id)
+        manager.draft_mode_override = args.draft_mode
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -97,7 +104,7 @@ def main():
             elif args.step == "plan":
                 manager.init_scenes()
             elif args.step == "draft":
-                manager.run_drafting_loop(auto_mode=args.auto)
+                manager.run_drafting_loop(auto_mode=args.auto, draft_mode=args.draft_mode)
             elif args.step == "review":
                 manager.run_review()
             elif args.step == "export":

@@ -1,6 +1,8 @@
 # src/providers/openai_provider.py
 from __future__ import annotations
 import os
+import time
+import random
 from typing import Any, Dict, Optional, Iterator, Tuple
 import json
 
@@ -24,6 +26,7 @@ try:
         RateLimitError,
         InternalServerError,
         httpx.TimeoutException,
+        httpx.RemoteProtocolError,
     )
 except Exception:
     RETRYABLE = (Exception,)
@@ -112,21 +115,34 @@ class OpenAIProvider(LLMProvider):
                 ],
             )
 
-        stream = retry_call(
-            _start_stream,
-            provider="openai",
-            max_retries=self.max_retries,
-            retryable_exceptions=RETRYABLE,
-        )
-
-        for event in stream:
-            # openai python: event.choices[0].delta.content
-            delta = getattr(event.choices[0], "delta", None)
-            if not delta:
-                continue
-            chunk = getattr(delta, "content", None)
-            if chunk:
-                yield chunk
+        # Retry not only stream creation but also interrupted reads.
+        for attempt in range(self.max_retries + 1):
+            emitted_any = False
+            try:
+                stream = retry_call(
+                    _start_stream,
+                    provider="openai",
+                    max_retries=self.max_retries,
+                    retryable_exceptions=RETRYABLE,
+                )
+                for event in stream:
+                    # openai python: event.choices[0].delta.content
+                    delta = getattr(event.choices[0], "delta", None)
+                    if not delta:
+                        continue
+                    chunk = getattr(delta, "content", None)
+                    if chunk:
+                        emitted_any = True
+                        yield chunk
+                return
+            except RETRYABLE:
+                # If any chunk was already emitted, retrying here would duplicate content.
+                if emitted_any:
+                    raise
+                if attempt >= self.max_retries:
+                    raise
+                sleep_s = 0.8 * (2**attempt) * (0.7 + random.random() * 0.6)
+                time.sleep(sleep_s)
 
     def generate_json(
         self, system: str, prompt: str, meta: Optional[Dict[str, Any]] = None
